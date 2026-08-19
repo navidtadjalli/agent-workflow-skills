@@ -4,6 +4,7 @@
 No network, no subprocesses, no real clock. Every value the daemon would read
 from the world is injected, so these tests assert on the logic itself.
 """
+import json
 import os
 import sys
 import tempfile
@@ -468,6 +469,114 @@ class TestStateDurability(unittest.TestCase):
         self.assertEqual(state.read_state()["mode"], "frozen")
         leftovers = [n for n in os.listdir(config_mod.home()) if n.startswith(".tmp-")]
         self.assertEqual(leftovers, [])
+
+
+class TestCodexGovernor(unittest.TestCase):
+    """Codex limits come from codex's own logs, so these tests write logs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "sessions", "2026", "08", "20")
+        os.makedirs(self.root)
+        self.now = 1_800_000_000.0
+
+    def _write(self, name, records):
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+        return path
+
+    def _limits(self, primary=None, secondary=None):
+        return {"payload": {"info": {"rate_limits": {
+            "limit_id": "codex", "primary": primary, "secondary": secondary}}}}
+
+    def test_reads_both_windows(self):
+        self._write("a.jsonl", [self._limits(
+            primary={"used_percent": 12.0, "window_minutes": 300,
+                     "resets_at": self.now + 3600},
+            secondary={"used_percent": 64.0, "window_minutes": 10080,
+                       "resets_at": self.now + 86400})])
+        reading = governor.codex.reading(self.now, root=self.tmp.name)
+        self.assertTrue(reading["ok"])
+        self.assertEqual(reading["session_pct"], 12.0)
+        self.assertEqual(reading["week_pct"], 64.0)
+
+    def test_keys_by_window_not_by_slot(self):
+        """The weekly window turns up under `primary` on some records."""
+        self._write("a.jsonl", [self._limits(
+            primary={"used_percent": 100.0, "window_minutes": 10080,
+                     "resets_at": self.now + 86400})])
+        reading = governor.codex.reading(self.now, root=self.tmp.name)
+        self.assertEqual(reading["week_pct"], 100.0)
+        self.assertIsNone(reading["session_pct"])
+
+    def test_null_limits_are_skipped(self):
+        self._write("a.jsonl", [self._limits(), self._limits(
+            primary={"used_percent": 5.0, "window_minutes": 300,
+                     "resets_at": self.now + 60})])
+        self.assertEqual(governor.codex.reading(
+            self.now, root=self.tmp.name)["session_pct"], 5.0)
+
+    def test_expired_reading_is_discarded(self):
+        self._write("a.jsonl", [self._limits(
+            primary={"used_percent": 99.0, "window_minutes": 300,
+                     "resets_at": self.now - 1})])
+        reading = governor.codex.reading(self.now, root=self.tmp.name)
+        self.assertFalse(reading["ok"])
+        self.assertIsNone(reading["session_pct"])
+
+    def test_newest_file_wins(self):
+        old = self._write("old.jsonl", [self._limits(
+            primary={"used_percent": 10.0, "window_minutes": 300,
+                     "resets_at": self.now + 60})])
+        new = self._write("new.jsonl", [self._limits(
+            primary={"used_percent": 90.0, "window_minutes": 300,
+                     "resets_at": self.now + 60})])
+        os.utime(old, (self.now - 600, self.now - 600))
+        os.utime(new, (self.now, self.now))
+        self.assertEqual(governor.codex.reading(
+            self.now, root=self.tmp.name)["session_pct"], 90.0)
+
+    def test_last_record_in_a_file_wins(self):
+        self._write("a.jsonl", [
+            self._limits(primary={"used_percent": 10.0, "window_minutes": 300,
+                                  "resets_at": self.now + 60}),
+            self._limits(primary={"used_percent": 40.0, "window_minutes": 300,
+                                  "resets_at": self.now + 60})])
+        self.assertEqual(governor.codex.reading(
+            self.now, root=self.tmp.name)["session_pct"], 40.0)
+
+    def test_empty_tree_is_optimistic_not_stale(self):
+        """No data must not block the lane -- the only way to get a reading is
+        to run codex, so blocking on absence would deadlock."""
+        empty = os.path.join(self.tmp.name, "nothing")
+        estimate = governor.codex.estimate(self.now, root=empty)
+        self.assertFalse(estimate["stale"])
+        self.assertEqual(estimate["session_pct"], 0.0)
+        self.assertEqual(estimate["source"], "codex-unknown")
+
+    def test_estimate_reports_the_worse_window(self):
+        self._write("a.jsonl", [self._limits(
+            primary={"used_percent": 12.0, "window_minutes": 300,
+                     "resets_at": self.now + 3600},
+            secondary={"used_percent": 100.0, "window_minutes": 10080,
+                       "resets_at": self.now + 86400})])
+        estimate = governor.codex.estimate(self.now, root=self.tmp.name)
+        self.assertEqual(estimate["session_pct"], 12.0)
+        self.assertEqual(estimate["week_pct"], 100.0)
+        self.assertEqual(estimate["source"], "codex-logs")
+
+    def test_malformed_lines_do_not_raise(self):
+        path = os.path.join(self.root, "bad.jsonl")
+        with open(path, "w") as fh:
+            fh.write("not json\n")
+            fh.write(json.dumps(self._limits(
+                primary={"used_percent": 7.0, "window_minutes": 300,
+                         "resets_at": self.now + 60})) + "\n")
+        self.assertEqual(governor.codex.reading(
+            self.now, root=self.tmp.name)["session_pct"], 7.0)
 
 
 if __name__ == "__main__":
