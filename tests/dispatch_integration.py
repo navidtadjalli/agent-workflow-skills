@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "skills", "dispatch"))
 from dispatch import chat as chat_mod  # noqa: E402
 from dispatch import config as config_mod  # noqa: E402
 from dispatch import daemon as daemon_mod  # noqa: E402
+from dispatch import lanes  # noqa: E402
 from dispatch import state  # noqa: E402
 
 STUB = """#!/usr/bin/env python3
@@ -151,7 +152,7 @@ class DispatchIntegration(unittest.TestCase):
         result = self._daemon(session_pct=90.0).tick()
         self.assertEqual(result["mode"], "frozen")
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "queued")
-        self.assertIsNotNone(state.read_state()["armed_resume_at"])
+        self.assertIsNotNone(state.read_state()["armed_resume_at"][lanes.CLAUDE])
 
     def test_headroom_refuses_a_step_that_would_cross_the_soft_limit(self):
         task = self._enqueue()
@@ -172,9 +173,9 @@ class DispatchIntegration(unittest.TestCase):
         self.assertEqual(settled["last_error"], "usage limit")
 
         doc = state.read_state()
-        self.assertEqual(doc["mode"], "frozen")
+        self.assertEqual(doc["mode"][lanes.CLAUDE], "frozen")
         self.assertEqual(doc["governor"]["session_pct"], 100.0)
-        self.assertEqual(doc["armed_resume_at"], self.now + 3600 + 60)
+        self.assertEqual(doc["armed_resume_at"][lanes.CLAUDE], self.now + 3600 + 60)
         self.assertTrue(os.path.exists(
             os.path.join(config_mod.task_dir(task["id"]), "handoff.md")))
 
@@ -183,7 +184,7 @@ class DispatchIntegration(unittest.TestCase):
         os.environ["STUB_RESET"] = str(int(self.now + 3600))
         task = self._enqueue()
         self._daemon().tick()
-        self.assertEqual(state.read_state()["mode"], "frozen")
+        self.assertEqual(state.read_state()["mode"][lanes.CLAUDE], "frozen")
 
         # Timer time arrives and a fresh reading confirms the window rolled over.
         self.now += 3700
@@ -191,7 +192,7 @@ class DispatchIntegration(unittest.TestCase):
         daemon = self._daemon(session_pct=4.0)
         daemon.tick()
 
-        self.assertEqual(state.read_state()["mode"], "running")
+        self.assertEqual(state.read_state()["mode"][lanes.CLAUDE], "running")
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "done")
 
     def test_unknown_repo_is_refused_not_guessed(self):

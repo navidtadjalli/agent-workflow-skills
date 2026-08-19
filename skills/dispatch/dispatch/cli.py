@@ -11,7 +11,7 @@ import sys
 
 from . import config as config_mod
 from . import daemon as daemon_mod
-from . import governor, state, usage, winddown
+from . import governor, lanes, state, usage, winddown
 
 PLUGIN_KEY = "telegram@claude-plugins-official"
 
@@ -32,13 +32,13 @@ def cmd_status(args):
     counts = {}
     for task in queue["tasks"]:
         counts[task["state"]] = counts.get(task["state"], 0) + 1
-    print("mode: %s" % doc.get("mode", winddown.RUNNING))
+    print("mode: %s" % doc["mode"][lanes.CLAUDE])
     print("usage: %s" % governor.summary(snapshot, now, tokens))
-    if doc.get("armed_resume_at"):
+    if doc["armed_resume_at"][lanes.CLAUDE]:
         import time
 
         print("resume armed: %s" % time.strftime(
-            "%Y-%m-%d %H:%M", time.localtime(doc["armed_resume_at"])))
+            "%Y-%m-%d %H:%M", time.localtime(doc["armed_resume_at"][lanes.CLAUDE])))
     print("queue: %s" % (" ".join("%s=%d" % kv for kv in sorted(counts.items()))
                          or "empty"))
     return 0
@@ -94,15 +94,15 @@ def cmd_cancel(args):
 
 def cmd_pause(args):
     with state.mutate_state() as doc:
-        doc["mode"] = "paused"
+        doc["mode"] = {lane: "paused" for lane in lanes.ALL}
     print("paused")
     return 0
 
 
 def cmd_resume(args):
     with state.mutate_state() as doc:
-        doc["mode"] = winddown.RUNNING
-        doc["armed_resume_at"] = None
+        doc["mode"] = {lane: winddown.RUNNING for lane in lanes.ALL}
+        doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
     print("running")
     return 0
 

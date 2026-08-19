@@ -14,13 +14,14 @@ import os
 import tempfile
 
 from . import config
+from . import lanes
 
 QUEUE_EMPTY = {"next_id": 1, "tasks": []}
 STATE_EMPTY = {
-    "mode": "running",
+    "mode": {"claude": "running", "codex": "running"},
     "chat_offset": 0,
     "governor": {},
-    "armed_resume_at": None,
+    "armed_resume_at": {"claude": None, "codex": None},
     "repo_cost_pct": {},
 }
 
@@ -108,7 +109,10 @@ def read_queue():
 
 
 def read_state():
-    return read(config.state_path(), STATE_EMPTY)
+    doc = read(config.state_path(), STATE_EMPTY)
+    doc["mode"] = lanes.normalize_mode(doc.get("mode"))
+    doc["armed_resume_at"] = lanes.normalize_armed(doc.get("armed_resume_at"))
+    return doc
 
 
 @contextlib.contextmanager
@@ -127,7 +131,8 @@ def mutate_state():
         write(config.state_path(), data)
 
 
-def new_task(queue, repo, prompt, priority=5, deps=None, isolation="repo", branch=None):
+def new_task(queue, repo, prompt, priority=5, deps=None, isolation="repo", branch=None,
+             agent="claude"):
     """Append a task to ``queue`` and return the record."""
     task_id = "t-%04d" % queue["next_id"]
     queue["next_id"] += 1
@@ -135,6 +140,7 @@ def new_task(queue, repo, prompt, priority=5, deps=None, isolation="repo", branc
         "id": task_id,
         "repo": repo,
         "prompt": prompt,
+        "agent": agent if agent in lanes.ALL else lanes.CLAUDE,
         "state": "queued",
         "priority": priority,
         "deps": list(deps or []),

@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import governor, parser, scheduler, state, usage, winddown, worker  # noqa: E402
+from dispatch import governor, lanes, parser, scheduler, state, usage, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -430,7 +430,7 @@ class TestStateDurability(unittest.TestCase):
 
     def test_missing_documents_read_as_empty(self):
         self.assertEqual(state.read_queue()["tasks"], [])
-        self.assertEqual(state.read_state()["mode"], "running")
+        self.assertEqual(state.read_state()["mode"], {"claude": "running", "codex": "running"})
 
     def test_corrupt_document_does_not_crash(self):
         config_mod.ensure_dirs()
@@ -466,7 +466,7 @@ class TestStateDurability(unittest.TestCase):
 
     def test_write_is_atomic_on_replace(self):
         state.write(config_mod.state_path(), {"mode": "frozen"})
-        self.assertEqual(state.read_state()["mode"], "frozen")
+        self.assertEqual(state.read_state()["mode"], {"claude": "frozen", "codex": "frozen"})
         leftovers = [n for n in os.listdir(config_mod.home()) if n.startswith(".tmp-")]
         self.assertEqual(leftovers, [])
 
@@ -577,6 +577,78 @@ class TestCodexGovernor(unittest.TestCase):
                          "resets_at": self.now + 60})) + "\n")
         self.assertEqual(governor.codex.reading(
             self.now, root=self.tmp.name)["session_pct"], 7.0)
+
+
+class TestLanes(unittest.TestCase):
+    def test_scalar_mode_expands_to_both_lanes(self):
+        self.assertEqual(lanes.normalize_mode("winding-down"),
+                         {"claude": "winding-down", "codex": "winding-down"})
+
+    def test_dict_mode_fills_missing_lane(self):
+        self.assertEqual(lanes.normalize_mode({"claude": "frozen"}),
+                         {"claude": "frozen", "codex": "running"})
+
+    def test_none_mode_defaults_to_running(self):
+        self.assertEqual(lanes.normalize_mode(None),
+                         {"claude": "running", "codex": "running"})
+
+    def test_unknown_lane_is_dropped(self):
+        self.assertEqual(lanes.normalize_mode({"claude": "frozen", "gemini": "running"}),
+                         {"claude": "frozen", "codex": "running"})
+
+    def test_scalar_armed_expands(self):
+        self.assertEqual(lanes.normalize_armed(1234.0),
+                         {"claude": 1234.0, "codex": 1234.0})
+
+    def test_armed_defaults_to_none(self):
+        self.assertEqual(lanes.normalize_armed(None),
+                         {"claude": None, "codex": None})
+
+    def test_task_lane_defaults_to_claude(self):
+        self.assertEqual(lanes.of({"id": "t-0001"}), "claude")
+        self.assertEqual(lanes.of({"id": "t-0001", "agent": "codex"}), "codex")
+
+    def test_unknown_agent_falls_back_to_claude(self):
+        self.assertEqual(lanes.of({"agent": "gemini"}), "claude")
+
+
+class TestStateMigration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._previous = os.environ.get("DISPATCH_HOME")
+        os.environ["DISPATCH_HOME"] = self.tmp.name
+        self.addCleanup(self._restore)
+        config_mod.ensure_dirs()
+
+    def _restore(self):
+        if self._previous is None:
+            os.environ.pop("DISPATCH_HOME", None)
+        else:
+            os.environ["DISPATCH_HOME"] = self._previous
+
+    def test_old_state_file_loads_with_lanes(self):
+        """A state.json written by the pre-lane version must still load."""
+        state.write(config_mod.state_path(), {
+            "mode": "frozen", "chat_offset": 12, "governor": {},
+            "armed_resume_at": 999.0, "repo_cost_pct": {}})
+        doc = state.read_state()
+        self.assertEqual(doc["mode"], {"claude": "frozen", "codex": "frozen"})
+        self.assertEqual(doc["armed_resume_at"], {"claude": 999.0, "codex": 999.0})
+        self.assertEqual(doc["chat_offset"], 12)
+
+    def test_fresh_state_is_per_lane(self):
+        doc = state.read_state()
+        self.assertEqual(doc["mode"], {"claude": "running", "codex": "running"})
+
+    def test_new_task_records_its_agent(self):
+        queue = dict(state.QUEUE_EMPTY, tasks=[])
+        task = state.new_task(queue, "qpay", "do a thing", agent="codex")
+        self.assertEqual(task["agent"], "codex")
+
+    def test_new_task_defaults_to_claude(self):
+        queue = dict(state.QUEUE_EMPTY, tasks=[])
+        self.assertEqual(state.new_task(queue, "qpay", "x")["agent"], "claude")
 
 
 if __name__ == "__main__":

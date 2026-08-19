@@ -9,6 +9,7 @@ usage values so it can be tested offline.
 __all__ = [
     "config",
     "state",
+    "lanes",
     "usage",
     "governor",
     "scheduler",

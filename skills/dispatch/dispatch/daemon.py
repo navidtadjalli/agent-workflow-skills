@@ -17,7 +17,7 @@ import time
 
 from . import chat as chat_mod
 from . import config as config_mod
-from . import governor, parser, scheduler, state, usage, winddown
+from . import governor, lanes, parser, scheduler, state, usage, winddown
 
 PARSE_PROMPT = (
     "Convert this request into a JSON array of tasks. Each element must have "
@@ -150,32 +150,40 @@ class Daemon:
         return {"mode": mode, "reading": reading, "running": sorted(self.running)}
 
     def _apply_mode(self, state_doc, snapshot, reading, now, tokens):
-        """Advance the wind-down state machine and persist the result."""
-        mode = winddown.next_mode(state_doc.get("mode", winddown.RUNNING),
+        """Advance the wind-down state machine and persist the result.
+
+        Bridge only -- this still drives the Claude lane alone. Task 9 gives
+        each lane its own wind-down; until then reads take the Claude lane and
+        writes fan out to both, so a state file with the old scalar shape
+        keeps loading and codex's half of the dict is never left stale.
+        """
+        mode = winddown.next_mode(state_doc["mode"][lanes.CLAUDE],
                                   reading["session_pct"], len(self.running),
                                   self.config, reading["stale"])
 
-        if mode == winddown.FROZEN and state_doc.get("mode") != winddown.FROZEN:
+        if mode == winddown.FROZEN and state_doc["mode"][lanes.CLAUDE] != winddown.FROZEN:
             armed = winddown.resume_at(reading.get("resets_at"))
-            state_doc["armed_resume_at"] = armed
+            state_doc["armed_resume_at"] = {lane: armed for lane in lanes.ALL}
             self.notify("frozen at %s · %s" % (
                 governor.summary(snapshot, now, tokens),
                 "resumes ~%s" % self._reset_text(reading) if armed else "resume not scheduled"))
 
         if mode == winddown.FROZEN:
+            claude_armed = state_doc["armed_resume_at"][lanes.CLAUDE]
             allowed, _ = winddown.can_resume(
-                dict(state_doc, mode=mode), reading["session_pct"], now,
-                self.config, reading["stale"])
+                dict(state_doc, mode=mode, armed_resume_at=claude_armed),
+                reading["session_pct"], now, self.config, reading["stale"])
             if allowed:
                 mode = winddown.RUNNING
-                state_doc["armed_resume_at"] = None
+                state_doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
                 self.notify("resumed · %s" % governor.summary(snapshot, now, tokens))
-            elif state_doc.get("armed_resume_at") and now >= state_doc["armed_resume_at"]:
+            elif (state_doc["armed_resume_at"][lanes.CLAUDE]
+                  and now >= state_doc["armed_resume_at"][lanes.CLAUDE]):
                 # The timer fired but the window has not actually rolled over.
                 # Confirm with a real poll next tick rather than trusting it.
                 self._force_poll = True
 
-        state_doc["mode"] = mode
+        state_doc["mode"] = {lane: mode for lane in lanes.ALL}
         state.write(config_mod.state_path(), state_doc)
         return mode
 
@@ -208,12 +216,12 @@ class Daemon:
                     "logs <id> · cancel <id> · pause · resume")
         if kind == "pause":
             with state.mutate_state() as doc:
-                doc["mode"] = "paused"
+                doc["mode"] = {lane: "paused" for lane in lanes.ALL}
             return "paused · in-flight step finishes, nothing new starts"
         if kind == "resume":
             with state.mutate_state() as doc:
-                doc["mode"] = winddown.RUNNING
-                doc["armed_resume_at"] = None
+                doc["mode"] = {lane: winddown.RUNNING for lane in lanes.ALL}
+                doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
             return "resumed"
         if kind == "cancel":
             return self.cancel(command.get("id"))
@@ -341,7 +349,7 @@ class Daemon:
             queue = state.read_queue()
             state_doc = state.read_state()
             ctx = {
-                "mode": state_doc.get("mode", winddown.RUNNING),
+                "mode": state_doc["mode"][lanes.CLAUDE],
                 "queue": queue,
                 "running": len(self.running),
                 "session_pct": reading["session_pct"],
@@ -407,13 +415,13 @@ class Daemon:
 
     def _settle(self, task_id, entry, result, state_doc, snapshot, reading):
         task = entry["task"]
-        mode = state_doc.get("mode", winddown.RUNNING)
 
         if result.get("limit_reset_at"):
             state_doc["governor"] = governor.note_limit_error(
                 state_doc.get("governor") or snapshot, result["limit_reset_at"])
-            state_doc["mode"] = winddown.FROZEN
-            state_doc["armed_resume_at"] = winddown.resume_at(result["limit_reset_at"])
+            state_doc["mode"] = {lane: winddown.FROZEN for lane in lanes.ALL}
+            state_doc["armed_resume_at"] = {
+                lane: winddown.resume_at(result["limit_reset_at"]) for lane in lanes.ALL}
 
         summary = (result.get("summary") or "").strip()
         message = "%s step %d: %s" % (task_id, task.get("steps_done", 0) + 1,
@@ -446,7 +454,7 @@ class Daemon:
                 record["last_error"] = "usage limit"
             else:
                 record["state"] = worker_next_state(result.get("status"),
-                                                    state_doc.get("mode", mode))
+                                                    state_doc["mode"][lanes.CLAUDE])
                 if record["state"] == "failed":
                     record["last_error"] = "no status block from worker"
             settled = dict(record)
