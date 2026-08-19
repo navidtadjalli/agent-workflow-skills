@@ -1,0 +1,15 @@
+[Unit]
+Description=dispatch daemon — queued headless agent work
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@EXEC@
+Restart=always
+RestartSec=10
+# The daemon must outlive the login session; queued work is the whole point.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

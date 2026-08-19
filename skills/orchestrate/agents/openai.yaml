@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate"
+  short_description: "Run complex work with one agent or a team"
+  default_prompt: "Use $orchestrate to execute this complex task with the safest effective mode."

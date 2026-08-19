@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dispatch"
+  short_description: "Queue headless agent work under a usage governor"
+  default_prompt: "Use $dispatch to queue, inspect, or steer background agent work within the plan budget."

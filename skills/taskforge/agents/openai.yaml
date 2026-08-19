@@ -1,0 +1,4 @@
+interface:
+  display_name: "Taskforge"
+  short_description: "Build resumable, acceptance-driven task plans"
+  default_prompt: "Use $taskforge to turn this project into a resumable single-agent execution plan."

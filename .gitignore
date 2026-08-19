@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+*.tmp
+test-results/
+__pycache__/
+*.pyc
