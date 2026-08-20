@@ -51,7 +51,7 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_root="$state_base/agent-workflow-skills/backups/$stamp"
 had_conflict=0
 
-for skill in taskforge orchestrate dispatch; do
+for skill in taskforge orchestrate; do
   if [ ! -f "$skills_dir/$skill/SKILL.md" ]; then
     printf 'error: missing source skill: %s\n' "$skills_dir/$skill/SKILL.md" >&2
     exit 2
@@ -74,7 +74,7 @@ preflight_one() {
   local root="$1"
   local skill src dest current
 
-  for skill in taskforge orchestrate dispatch; do
+  for skill in taskforge orchestrate; do
     src="$skills_dir/$skill"
     dest="$root/$skill"
 
@@ -97,7 +97,7 @@ install_one() {
 
   ensure_dir "$root"
 
-  for skill in taskforge orchestrate dispatch; do
+  for skill in taskforge orchestrate; do
     src="$skills_dir/$skill"
     dest="$root/$skill"
 

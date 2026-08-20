@@ -35,7 +35,7 @@ if command -v shellcheck >/dev/null 2>&1; then
   pass 'shellcheck'
 fi
 
-for skill_name in taskforge orchestrate dispatch; do
+for skill_name in taskforge orchestrate; do
   skill_dir="$repo_dir/skills/$skill_name"
   skill_file="$skill_dir/SKILL.md"
   metadata_file="$skill_dir/agents/openai.yaml"
@@ -82,7 +82,7 @@ install_home="$tmp_dir/install-home"
 mkdir -p "$install_home"
 HOME="$install_home" "$repo_dir/install.sh" --all >/dev/null
 
-for skill_name in taskforge orchestrate dispatch; do
+for skill_name in taskforge orchestrate; do
   [ -L "$install_home/.claude/skills/$skill_name" ] ||
     fail "Claude install missing $skill_name"
   [ -L "$install_home/.agents/skills/$skill_name" ] ||
