@@ -133,6 +133,68 @@ class TestGovernorPolling(unittest.TestCase):
         snapshot = dict(governor.blank(), polled_at=1000.0, session_reset=1100.0)
         self.assertTrue(governor.should_poll(snapshot, 1101.0, config=CONFIG))
 
+    def test_a_genuine_rollover_costs_exactly_one_confirming_poll(self):
+        """The legitimate path must keep working: the window really does roll
+        over, one poll confirms it, and the fresh reading carries the next
+        reset -- after which the cadence takes over again."""
+        snapshot = governor.record_poll(
+            governor.blank(), {"ok": True, "at": 1000.0, "session_pct": 40.0,
+                               "session_reset": 5000.0, "week_pct": 5.0,
+                               "week_reset": 600000.0}, 0)
+        self.assertTrue(governor.should_poll(snapshot, 5001.0, config=CONFIG))
+        confirmed = governor.record_poll(
+            snapshot, {"ok": True, "at": 5001.0, "session_pct": 1.0,
+                       "session_reset": 23000.0, "week_pct": 6.0,
+                       "week_reset": 600000.0}, 0)
+        self.assertEqual(confirmed["session_reset"], 23000.0)
+        self.assertFalse(governor.should_poll(confirmed, 5062.0, config=CONFIG))
+
+    def test_a_reset_already_past_is_never_stored(self):
+        """A reset behind the poll's own clock satisfies should_poll's
+        rolled-over branch on every tick, so storing one turns the governor
+        into a request pump against the limit it is measuring."""
+        snapshot = governor.record_poll(
+            governor.blank(), {"ok": True, "at": 5000.0, "session_pct": 18.0,
+                               "session_reset": 1200.0, "week_pct": 17.0,
+                               "week_reset": 900.0}, 0)
+        self.assertIsNone(snapshot["session_reset"])
+        self.assertIsNone(snapshot["week_reset"])
+        self.assertFalse(governor.should_poll(snapshot, 5061.0, config=CONFIG))
+        self.assertFalse(governor.estimate(snapshot, 5061.0, 0)["stale"])
+
+    def test_a_latched_past_reset_is_cleared_by_the_next_poll(self):
+        """State latched before this fix -- or a limit error carrying an old
+        epoch -- must not survive a poll, whatever the new reading says."""
+        latched = dict(governor.blank(), polled_at=1000.0, session_reset=1200.0,
+                       session_pct=18.0, tokens_at_poll=0)
+        self.assertTrue(governor.should_poll(latched, 5000.0, config=CONFIG))
+        cleared = governor.record_poll(
+            latched, {"ok": True, "at": 5000.0, "session_pct": 20.0,
+                      "session_reset": None, "week_pct": None,
+                      "week_reset": None}, 0)
+        self.assertIsNone(cleared["session_reset"])
+        self.assertFalse(governor.should_poll(cleared, 5061.0, config=CONFIG))
+
+    def test_a_future_reset_survives_a_reading_that_omits_one(self):
+        snapshot = governor.record_poll(
+            governor.blank(), {"ok": True, "at": 1000.0, "session_pct": 10.0,
+                               "session_reset": 20000.0, "week_pct": 5.0,
+                               "week_reset": 600000.0}, 0)
+        kept = governor.record_poll(
+            snapshot, {"ok": True, "at": 2000.0, "session_pct": 12.0,
+                       "session_reset": 20000.0, "week_pct": None,
+                       "week_reset": None}, MILLION)
+        self.assertEqual(kept["session_reset"], 20000.0)
+        self.assertEqual(kept["week_reset"], 600000.0)
+
+    def test_a_failed_poll_does_not_touch_a_stored_reset(self):
+        snapshot = governor.record_poll(
+            governor.blank(), {"ok": True, "at": 1000.0, "session_pct": 10.0,
+                               "session_reset": 20000.0, "week_pct": 5.0,
+                               "week_reset": 600000.0}, 0)
+        failed = governor.record_poll(snapshot, {"ok": False, "error": "timeout"}, 0)
+        self.assertEqual(failed["session_reset"], 20000.0)
+
 
 class TestGovernorEstimate(unittest.TestCase):
     def _two_polls(self):
@@ -260,6 +322,130 @@ class TestUsageParsing(unittest.TestCase):
 
         noon = _time.mktime((2026, 2, 3, 12, 0, 0, 0, 1, -1))
         self.assertGreater(usage.parse_reset("7:50am", noon), noon)
+
+
+def _local(year, month, day, hour=0, minute=0):
+    """Epoch of a local wall-clock moment.
+
+    Both the injected ``now`` and the expected answer go through this, so every
+    assertion below holds in any timezone and in whatever month the suite
+    happens to be run.
+    """
+    return time.mktime((year, month, day, hour, minute, 0, 0, 1, -1))
+
+
+class TestResetParsing(unittest.TestCase):
+    """Reset expressions in the shapes ``/usage`` actually emits.
+
+    ``REAL_OUTPUT`` is verbatim from one real ``claude -p /usage`` call. No test
+    here -- or anywhere -- may spend another one.
+    """
+
+    REAL_OUTPUT = (
+        "Current session: 18% used \u00b7 resets Aug 20, 7:20pm (Asia/Tehran)\n"
+        "Current week (all models): 17% used \u00b7 resets Aug 26, 1:30pm (Asia/Tehran)\n")
+
+    def test_month_day_and_time(self):
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("Aug 20, 7:20pm (Asia/Tehran)", now),
+                         _local(2026, 8, 20, 19, 20))
+        self.assertEqual(usage.parse_reset("Aug 26, 1:30pm (Asia/Tehran)", now),
+                         _local(2026, 8, 26, 13, 30))
+
+    def test_month_day_and_time_read_from_another_month(self):
+        # The same strings six months earlier: the answer is a function of the
+        # expression, not of the month the suite runs in.
+        now = _local(2026, 2, 3, 12, 0)
+        self.assertEqual(usage.parse_reset("Aug 20, 7:20pm (Asia/Tehran)", now),
+                         _local(2026, 8, 20, 19, 20))
+        self.assertEqual(usage.parse_reset("Aug 26, 1:30pm (Asia/Tehran)", now),
+                         _local(2026, 8, 26, 13, 30))
+
+    def test_month_day_on_a_twenty_four_hour_clock(self):
+        # The CLI's rendering follows the locale; both forms must land.
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("Aug 20, 19:20", now),
+                         _local(2026, 8, 20, 19, 20))
+        self.assertEqual(usage.parse_reset("Aug 20, 19:20 (Asia/Tehran)", now),
+                         _local(2026, 8, 20, 19, 20))
+
+    def test_month_day_around_midnight_and_noon(self):
+        now = _local(2026, 8, 20, 10, 0)
+        self.assertEqual(usage.parse_reset("Aug 21, 12:05am", now),
+                         _local(2026, 8, 21, 0, 5))
+        self.assertEqual(usage.parse_reset("Aug 20, 12:05pm", now),
+                         _local(2026, 8, 20, 12, 5))
+
+    def test_a_year_is_not_mistaken_for_a_time(self):
+        now = _local(2026, 8, 20, 10, 0)
+        self.assertEqual(usage.parse_reset("Aug 21 2026", now), _local(2026, 8, 21))
+
+    def test_a_bare_calendar_day_is_still_midnight(self):
+        now = _local(2026, 2, 3, 12, 0)
+        self.assertEqual(usage.parse_reset("Feb 5", now), _local(2026, 2, 5))
+
+    def test_a_bare_calendar_day_far_past_still_rolls_a_year(self):
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("Feb 5", now), _local(2027, 2, 5))
+
+    def test_clock_and_relative_forms_are_unchanged(self):
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("7:50pm", now), _local(2026, 8, 20, 19, 50))
+        self.assertEqual(usage.parse_reset("7:50am", now), _local(2026, 8, 21, 7, 50))
+        self.assertEqual(usage.parse_reset("in 2h 15m", now), now + 2 * 3600 + 15 * 60)
+        self.assertEqual(usage.parse_reset("in 45m", now), now + 45 * 60)
+
+    def test_iso_form_is_unchanged(self):
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("2026-08-20T19:20:00", now),
+                         _local(2026, 8, 20, 19, 20))
+
+    def test_absolute_epochs_are_taken_literally(self):
+        # An epoch states a moment outright rather than reconstructing one from
+        # a partial expression, so it is not second-guessed here even when it
+        # is behind `now` -- `governor.record_poll` is what refuses to store a
+        # past reset, whichever branch produced it.
+        now = _local(2026, 8, 20, 15, 50)
+        self.assertEqual(usage.parse_reset("1755600000", now), 1755600000.0)
+        self.assertEqual(usage.parse_reset("1755600000000", now), 1755600000.0)
+
+    def test_a_reset_in_the_past_is_not_a_reset(self):
+        # Every one of these expressions describes a future moment, so a result
+        # behind `now` is a misparse or a stale reading. "Unknown" is the only
+        # honest answer: a past reset tells the governor the window just rolled
+        # over, on every single tick, forever.
+        self.assertIsNone(
+            usage.parse_reset("Aug 20, 7:20pm (Asia/Tehran)", _local(2026, 8, 20, 20, 0)))
+        self.assertIsNone(usage.parse_reset("Aug 20, 19:20", _local(2026, 8, 20, 20, 0)))
+        # A `Feb 5` only slightly past: too near for the year-roll, still past.
+        self.assertIsNone(usage.parse_reset("Feb 5", _local(2026, 2, 5, 14, 0)))
+        self.assertIsNone(usage.parse_reset("Feb 5", _local(2026, 3, 1, 9, 0)))
+
+    def test_unparseable_expressions_stay_none(self):
+        now = _local(2026, 8, 20, 15, 50)
+        for text in ("", "   ", "sometime soon", "Xyz 20, 7:20pm", "Aug 20, 99:99"):
+            self.assertIsNone(usage.parse_reset(text, now), text)
+
+    def test_the_real_usage_output(self):
+        now = _local(2026, 8, 20, 15, 50)
+        reading = usage.parse_usage_text(self.REAL_OUTPUT, now)
+        self.assertEqual(reading["session_pct"], 18.0)
+        self.assertEqual(reading["week_pct"], 17.0)
+        self.assertEqual(reading["session_reset"], _local(2026, 8, 20, 19, 20))
+        self.assertEqual(reading["week_reset"], _local(2026, 8, 26, 13, 30))
+
+    def test_the_real_usage_output_leaves_the_lane_admitting(self):
+        """The live symptom: the session reset landed 15 hours in the past, so
+        every estimate came back `post-reset`/stale and `admit` refused every
+        task with "usage unknown; poll first"."""
+        now = _local(2026, 8, 20, 15, 50)
+        reading = dict(usage.parse_usage_text(self.REAL_OUTPUT, now), ok=True, at=now)
+        snapshot = governor.record_poll(governor.blank(), reading, 0)
+        estimate = governor.estimate(snapshot, now + 60, 0)
+        self.assertFalse(estimate["stale"])
+        self.assertEqual(estimate["source"], "measured")
+        # And it does not poll again every floor-length tick.
+        self.assertFalse(governor.should_poll(snapshot, now + 61, config=CONFIG))
 
 
 class TestScheduler(unittest.TestCase):

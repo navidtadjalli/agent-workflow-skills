@@ -110,9 +110,12 @@ def record_poll(snapshot, reading, tokens_now):
         snapshot.get("week_pct"), reading.get("week_pct"),
         snapshot.get("tokens_at_poll"), tokens_now)
 
-    for key in ("session_pct", "session_reset", "week_pct", "week_reset"):
+    for key in ("session_pct", "week_pct"):
         if reading.get(key) is not None:
             updated[key] = reading[key]
+    at = reading.get("at")
+    for key in ("session_reset", "week_reset"):
+        updated[key] = _reset_to_keep(reading.get(key), snapshot.get(key), at)
     updated["polled_at"] = reading.get("at")
     updated["tokens_at_poll"] = tokens_now
     updated["last_poll_ok"] = True
@@ -122,6 +125,31 @@ def record_poll(snapshot, reading, tokens_now):
     if override and reading.get("at") and reading["at"] >= override:
         updated["override_until"] = None
     return updated
+
+
+def _reset_to_keep(fresh, stored, at):
+    """The reset worth storing, given a fresh reading and what was there.
+
+    A reset already behind the poll's own clock is refused outright. It is not
+    a rollover, it is a latch: ``should_poll`` reads ``now >= session_reset`` as
+    "the window turned, confirm it", and a past reset satisfies that on every
+    tick -- one request per ``poll_floor``, forever, against the very limit the
+    poll is measuring. ``estimate`` reads the same thing as ``post-reset`` and
+    marks itself stale, so ``scheduler.admit`` refuses every task while it does
+    so. One bad timestamp therefore both jams the lane and pumps requests.
+
+    A poll that carries no reset at all does not get to carry an expired one
+    forward either. Otherwise the latch merely waits for a later poll to happen
+    to parse a reset, which is not a bound. What survives a poll is only ever a
+    reset still ahead of it -- which is exactly what a genuine rollover
+    produces, so the legitimate single confirming poll is untouched.
+    """
+    if at is None:
+        # No clock came with the reading, so there is nothing to judge against.
+        return fresh if fresh is not None else stored
+    if fresh is not None:
+        return fresh if fresh > at else None
+    return stored if stored is not None and stored > at else None
 
 
 def _relearn(current, old_pct, new_pct, old_tokens, new_tokens):
