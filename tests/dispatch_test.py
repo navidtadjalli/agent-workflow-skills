@@ -766,7 +766,8 @@ class TestPromptFile(unittest.TestCase):
         task = {"id": "t-0002", "repo": "qpay", "prompt": "ship it",
                 "branch": "tg/t-0002", "agent": "claude"}
         path = worker.write_prompt(task, self.tmp.name)
-        body = open(path).read()
+        with open(path) as fh:
+            body = fh.read()
         self.assertTrue(body.startswith("ship it"))
         self.assertIn("tg/t-0002", body)
 
@@ -775,7 +776,8 @@ class TestPromptFile(unittest.TestCase):
         nasty = 'rm -rf $HOME; echo "`whoami`" && exit 1'
         task = {"id": "t-0003", "repo": "qpay", "prompt": nasty,
                 "branch": "tg/t-0003", "agent": "claude"}
-        self.assertIn(nasty, open(worker.write_prompt(task, self.tmp.name)).read())
+        with open(worker.write_prompt(task, self.tmp.name)) as fh:
+            self.assertIn(nasty, fh.read())
 
     def test_prompt_is_fed_on_stdin_not_argv(self):
         recorded = {}
@@ -791,7 +793,9 @@ class TestPromptFile(unittest.TestCase):
 
         def fake_popen(argv, **kwargs):
             recorded["argv"] = argv
-            recorded["stdin"] = kwargs.get("stdin")
+            stdin = kwargs.get("stdin")
+            recorded["stdin"] = stdin
+            recorded["stdin_content"] = stdin.read() if stdin else None
             return FakeProcess()
 
         task = {"id": "t-0004", "repo": "qpay", "prompt": "secret words",
@@ -800,6 +804,7 @@ class TestPromptFile(unittest.TestCase):
                         task_dir=self.tmp.name)
         self.assertNotIn("secret words", " ".join(recorded["argv"]))
         self.assertIsNotNone(recorded["stdin"])
+        self.assertIn("secret words", recorded["stdin_content"])
 
 
 if __name__ == "__main__":
