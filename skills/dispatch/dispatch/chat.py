@@ -15,7 +15,10 @@ reachable when this one is not.
 and the bot token is never copied there.
 
 The allowlist is the authentication boundary, and it fails closed: an empty one
-admits nobody, and a live transport cannot be built without one at all.
+admits nobody, and a live transport cannot be built without one at all. What
+counts as empty is decided in one place, ``normalize_allowlist``, because the
+daemon, the transport and the CLI all read the same config value and a
+disagreement between them is a hole.
 """
 import json
 import urllib.parse
@@ -24,14 +27,53 @@ import urllib.request
 API = "https://api.telegram.org/bot%s/%s"
 
 
+def _as_id(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace").strip()
+    try:
+        return str(value).strip()
+    except Exception:  # noqa: BLE001 - a __str__ that raises is not an id
+        return ""
+
+
+def normalize_allowlist(value):
+    """Any config shape -> a list of chat-id strings. Never raises.
+
+    ``chat_allowlist`` is typed by whoever edits config.json, and the design
+    requires that file to stay hand-repairable, so a wrong type is an expected
+    input rather than an impossible one. Every consumer goes through here so
+    they cannot disagree about what a value means:
+
+    - a bare string or int is one id written without brackets. Iterating a
+      string instead gives ten single-character ids -- admitting chat id "7"
+      while denying the owner.
+    - a bool, a dict, a float, anything else uninterpretable, is not an
+      allowlist at all and normalises to ``[]``, which the daemon answers with
+      ``NullChat`` and a standing reason. Raising here instead would be a
+      traceback at startup, under a cron watchdog, on the only interface.
+    - ``None`` and blank entries are dropped: ``[None]`` used to become
+      ``["None"]``, a non-empty allowlist admitting nobody real.
+    """
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (str, bytes, int)):
+        value = [value]
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    ids = []
+    for item in value:
+        if item is None or isinstance(item, bool):
+            continue
+        text = _as_id(item)
+        if text:
+            ids.append(text)
+    return ids
+
+
 class Chat:
     def __init__(self, token, allowlist=None, opener=None, timeout=30):
         self._token = token
-        # A bare string is a list of characters to `for`, and "7" is a chat id
-        # somebody holds. One id written without brackets means that one id.
-        if isinstance(allowlist, (str, bytes)):
-            allowlist = [allowlist]
-        self.allowlist = [str(c) for c in (allowlist or []) if str(c)]
+        self.allowlist = normalize_allowlist(allowlist)
         if not self.allowlist:
             # Refusing to exist is the second half of failing closed. `allowed`
             # denies an empty allowlist on its own; this makes a transport that

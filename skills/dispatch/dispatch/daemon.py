@@ -153,13 +153,15 @@ class Daemon:
 
         The allowlist is checked before the token, because an empty allowlist
         is the more dangerous of the two conditions and the one a corrupt
-        config.json produces silently. The daemon still starts: it keeps
+        config.json produces silently. It is normalised first, and by the same
+        function every other consumer uses: this is the only path that builds a
+        real transport, so a shape it interprets differently from ``Chat`` is a
+        hole in the boundary rather than a difference of opinion. The daemon still starts: it keeps
         draining the queue for `dispatch add`, and `dispatch status` can say
         why chat is refused -- where a refusal to start would leave a crash
         loop under the watchdog and nothing to read it from.
         """
-        allowlist = [str(c) for c in (self.config.get("chat_allowlist") or [])
-                     if str(c)]
+        allowlist = chat_mod.normalize_allowlist(self.config.get("chat_allowlist"))
         if not allowlist:
             reason = ("chat allowlist is empty · chat intake refused · set one "
                       "with `dispatch setup --chat <chat-id>`")
@@ -229,8 +231,15 @@ class Daemon:
             return "volume report unavailable: %s" % exc
 
     def notify(self, text):
+        """Announce something to the listed chats -- and only to those.
+
+        Normalised for the same reason intake is: the raw value fanned a bare
+        string out to one message per character, so ten strangers' chat ids got
+        a notice for every task.
+        """
         self.notices.append(text)
-        for chat_id in self.config.get("chat_allowlist") or []:
+        for chat_id in chat_mod.normalize_allowlist(
+                self.config.get("chat_allowlist")):
             self.chat.send(chat_id, text)
 
     def _reset_text(self, reading):

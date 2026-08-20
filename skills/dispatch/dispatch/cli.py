@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 
+from . import chat as chat_mod
 from . import config as config_mod
 from . import daemon as daemon_mod
 from . import governor, lanes, repos, state, usage, volume
@@ -288,20 +289,33 @@ def _keep_unreadable_config():
     are kept rather than the operator's recollection of them.
     """
     path = config_mod.config_path()
+    # Bound before the try: a *read* that fails leaves nothing to copy, and
+    # falling through to write it raised UnboundLocalError -- a traceback out
+    # of `main()`, in the repair command, after the plugin has already been
+    # disabled. That leaves the cutover with neither interface.
+    body = None
     try:
         with open(path) as fh:
             body = fh.read()
         json.loads(body)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as exc:
+        read_error = exc
     else:
+        return None
+    if body is None:
+        print("warning: could not read %s to keep a copy (%s: %s); it is left "
+              "where it is" % (path, type(read_error).__name__, read_error),
+              file=sys.stderr)
         return None
     kept = path + ".corrupt"
     try:
         with open(kept, "w") as fh:
             fh.write(body)
+        # The same ids and repo paths as the file it came from, so the same
+        # mode: the copy is written at the ambient umask otherwise.
+        os.chmod(kept, 0o600)
     except OSError as exc:
         print("warning: could not keep the unreadable %s (%s)" % (path, exc),
               file=sys.stderr)
@@ -321,7 +335,7 @@ def _warn_empty_allowlist(cfg=None):
     queue and `dispatch add` still work without chat.
     """
     cfg = config_mod.load() if cfg is None else cfg
-    if cfg.get("chat_allowlist"):
+    if chat_mod.normalize_allowlist(cfg.get("chat_allowlist")):
         return False
     print("warning: chat_allowlist is empty; the daemon will refuse every "
           "chat. Fix it with: dispatch setup --chat <chat-id>", file=sys.stderr)
@@ -366,7 +380,9 @@ def cmd_up(args):
         # cutover means no interface at all.
         print("warning: no bot token at %s; the daemon will run with no chat "
               "transport" % config_mod.token_env_path(), file=sys.stderr)
-    _warn_empty_allowlist()
+    # Loaded here and passed down, as `setup` does: `load` reports a config it
+    # cannot read, and one command reading the file twice would say so twice.
+    _warn_empty_allowlist(config_mod.load())
     return 0
 
 

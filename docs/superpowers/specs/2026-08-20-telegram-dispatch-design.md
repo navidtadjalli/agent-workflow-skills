@@ -84,7 +84,11 @@ routes approval requests through its own automatic review and holds the
 workspace to the process's working directory, which is the repo the task was
 queued against. That is the default, selected by the `codex_sandbox` config key.
 `read-only`, `workspace-write` and `danger-full-access` pass `-s` straight
-through, and `bypass` is `--dangerously-bypass-approvals-and-sandbox` -- the
+through -- on a first step only, since the resume parser takes none of them, so
+a continuation falls back to `~/.codex/config.toml` (workspace-write inside
+`~/Projects`, which is marked trusted there) -- and `bypass` is
+`--dangerously-bypass-approvals-and-sandbox`, the only mode that applies to
+every step -- the
 original behaviour, still reachable, because the confined mode has not been run
 against a live codex here and a mode that stalls waiting for an approval has to
 be recoverable by editing one value. An unrecognised value resolves to the
@@ -390,8 +394,13 @@ by an unattended agent running without permission prompts, from any message that
 passes the chat allowlist. The allowlist is a single chat id and is the only
 thing standing in front of that.
 
-Because it is the only thing, it fails closed. An empty allowlist means nobody,
-not everybody: `Chat.allowed` denies it, `Chat` refuses to be constructed
+Because it is the only thing, it fails closed. Anything that is not a list of
+chat ids -- a bare string, an unquoted number, `true`, an object, a list of
+blanks -- is normalised in one place, by one function every consumer calls, so
+the daemon, the transport and the CLI cannot disagree about what a config value
+means. A bare string means that one id, not ten single-character ones;
+everything uninterpretable means nobody. An empty allowlist means nobody, not
+everybody: `Chat.allowed` denies it, `Chat` refuses to be constructed
 without one at all, and the daemon answers an empty allowlist by running with no
 chat transport and a standing reason -- printed at startup and shown by
 `dispatch status` -- rather than by serving one. That matters because the

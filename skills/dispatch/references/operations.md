@@ -115,7 +115,7 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Mode stays `frozen` past the reset | Reset time was misparsed | `dispatch usage --poll`, then `dispatch resume` |
 | A lane reads `frozen` with a low session percentage | Its weekly window is at or above the soft limit | Nothing: it resumes when the week resets. `dispatch status` shows both windows |
 | The bot answers nothing, everything else looks healthy | Chat transport is failing | `dispatch status` prints the last transport error and how many polls have failed in a row |
-| The bot answers nobody, and `status` says the allowlist is empty | `config.json` is missing or did not parse, so the defaults are in force | `dispatch setup --chat <chat-id>`; check stderr for the `config.json.corrupt` line first |
+| The bot answers nobody, and `status` says the allowlist is empty | `config.json` is missing, did not parse, or holds something that is not a list of ids | `dispatch setup --chat <chat-id>`, then **`dispatch down && dispatch up`** -- the transport is built once at startup and is never rebuilt, so a config edit does not revive a running daemon. Check stderr for a `config.json.corrupt` line first |
 | Session gone, no explanation in the pane | The daemon died with it | `dispatch logs --daemon` falls back to `daemon.log`, which outlives the session |
 | Task `failed` with `checkpoint failed: ...` | The step's work could not be committed | Fix the repo (a stale lock, a conflicting ref), then re-add; the tree still holds the work |
 
@@ -133,6 +133,14 @@ daemon runs with no chat transport, printing why at startup and reporting it in
 starts, so the queue and `dispatch add` keep working while the allowlist is
 fixed -- a daemon that refused to start would just be relaunched by the watchdog
 every five minutes.
+
+Anything that is not a list of ids is treated as empty, not as a best effort.
+`"chat_allowlist": "7256243815"` means that one id (not ten single-character
+ones); an unquoted number means that id; `true`, an object, or a list of blanks
+mean nobody, and land on the same refusal. The daemon, the transport and the
+CLI all read the value through one function, so they cannot disagree about what
+it means. Note that the allowlist is read once at startup: after editing it,
+`dispatch down && dispatch up`.
 
 **Codex workers run inside codex's own sandbox.** `codex_sandbox` selects the
 mode, and the default is `approve-for-me`: unattended, with approval requests
@@ -155,12 +163,22 @@ EOF
 dispatch down && dispatch up
 ```
 
-One asymmetry: `codex exec resume` parses a narrower set of options than `codex
-exec` and accepts neither `-s` nor `--approve-for-me` (measured on codex-cli
-0.148.0). A continuation step therefore carries no sandbox flag at all unless
-`codex_sandbox` is `bypass`, and runs under codex's own default policy. It is
-also not passed `-C`, which that parser rejects outright; the worker launches
-the process in the repository either way.
+**`read-only` and `workspace-write` are first-step-only settings.** `codex exec
+resume` parses a narrower set of options than `codex exec` and accepts neither
+`-s` nor `--approve-for-me` (measured on codex-cli 0.148.0); it is also not
+passed `-C`, which that parser rejects outright, though the worker launches the
+process in the repository either way. So a continuation step carries no sandbox
+flag at all unless `codex_sandbox` is `bypass`, and falls back to codex's own
+configuration. On this machine that resolves to **workspace-write inside
+`~/Projects`**, because `~/.codex/config.toml` marks that tree
+`trust_level = "trusted"`, and read-only outside it.
+
+Two consequences worth holding on to. `bypass` is the only mode that applies to
+every step of a task. And a task that takes more than one step is confined by
+`~/.codex/config.toml` from step two onward, not by `codex_sandbox` -- a
+security setting that stops applying halfway through is worth knowing about
+before it matters, so check the trust levels in that file if a repo needs to be
+more confined than the rest of `~/Projects`.
 
 Claude has no equivalent flag: `--dangerously-skip-permissions` is how a
 headless Claude worker runs unattended, and the confinement there is the repo it

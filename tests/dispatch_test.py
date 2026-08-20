@@ -959,6 +959,20 @@ class TestBackends(unittest.TestCase):
         "--output-schema", "--json", "-o", "--output-last-message",
     }
 
+    def test_a_sandbox_mode_that_is_not_a_string_takes_the_default_path(self):
+        """`{"codex_sandbox": ["bypass"]}` raised `TypeError: unhashable type`
+        out of the dict lookup, inside the worker, killing the step rather than
+        the value."""
+        for mode in (["bypass"], {"mode": "bypass"}, 7, True):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                argv = backends.codex.build_command(
+                    dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+                    self.tmp.name, config={"codex_sandbox": mode})
+            self.assertIn("--approve-for-me", argv, repr(mode))
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                             argv, repr(mode))
+            self.assertIn("codex_sandbox", err.getvalue(), repr(mode))
+
     def test_a_resumed_step_does_not_pass_a_working_directory(self):
         """`-C` is rejected by the resume parser, and unnecessary anywhere:
         `run_step` launches the process with `cwd=cwd` regardless."""
@@ -2122,6 +2136,59 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertIn("allowlist",
                       daemon_mod.chat_status_line(state.read_state()))
 
+    def _token_env(self):
+        env = os.path.join(self.tmp.name, "token.env")
+        with open(env, "w") as fh:
+            fh.write("TELEGRAM_BOT_TOKEN=123456:SECRET-BOT-TOKEN\n")
+        return mock.patch.dict(os.environ, {"DISPATCH_TOKEN_ENV": env})
+
+    # value in config.json -> transport, and the ids it will admit.
+    ALLOWLIST_SHAPES = [
+        ("7256243815", "Chat", ["7256243815"]),
+        (7256243815, "Chat", ["7256243815"]),
+        (["7256243815"], "Chat", ["7256243815"]),
+        (["7256243815", 42], "Chat", ["7256243815", "42"]),
+        (True, "NullChat", []),
+        ({"a": 1}, "NullChat", []),
+        ([], "NullChat", []),
+        ([None], "NullChat", []),
+        (["", "  "], "NullChat", []),
+    ]
+
+    def test_every_allowlist_shape_from_config_lands_somewhere_safe(self):
+        """Asserted through `_default_chat`, which is the only path that runs.
+
+        The constructor guard in `chat.py` was reached with a list already
+        built by the daemon, so it never saw the shapes it was written for: a
+        bare string produced a live transport admitting chat id `7` while
+        denying the owner, a bare int crashed the daemon before the tick guard
+        could catch it, and a dict produced a transport admitting `a`.
+        """
+        for value, transport, expected in self.ALLOWLIST_SHAPES:
+            daemon = self._daemon()
+            daemon.config["chat_allowlist"] = value
+            with self._token_env():
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    chat = daemon._default_chat()
+            self.assertEqual(type(chat).__name__, transport, repr(value))
+            self.assertEqual(getattr(chat, "allowlist", []), expected, repr(value))
+            if transport == "NullChat":
+                self.assertIn("allowlist", chat.last_error, repr(value))
+                self.assertIn("allowlist", err.getvalue(), repr(value))
+
+    def test_notify_reaches_the_listed_ids_and_no_others(self):
+        """Outbound side of the same value. A bare string used to fan every
+        task notice out to ten single-digit chat ids."""
+        from dispatch import chat as chat_mod
+
+        for value, _, expected in self.ALLOWLIST_SHAPES:
+            daemon = self._daemon()
+            daemon.config["chat_allowlist"] = value
+            daemon.chat = chat_mod.NullChat()
+            daemon.notify("step done")
+            self.assertEqual([chat_id for chat_id, _ in daemon.chat.sent],
+                             expected, repr(value))
+
     # -- crash handling ------------------------------------------------------
 
     def test_a_tick_that_raises_does_not_take_the_daemon_with_it(self):
@@ -2665,6 +2732,18 @@ class TestCliLifecycle(_CliEnv):
         self.assertIn("chat_allowlist is empty", err)
         self.assertIn("dispatch setup --chat", err)
 
+    def test_up_reports_an_unreadable_config_once(self):
+        """One command, one reading of the file: `_warn_empty_allowlist` takes
+        the config `up` already loaded rather than loading its own."""
+        config_mod.ensure_dirs()
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('{"chat_allowlist": ["1"')
+        runner, _ = self._runner(alive=False)
+        _, _, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertEqual(err.count("is unreadable"), 1, err)
+        self.assertIn("chat_allowlist is empty", err)
+
     def test_up_is_quiet_about_an_allowlist_that_names_somebody(self):
         state.write(config_mod.config_path(), {"chat_allowlist": ["7256243815"]})
         runner, _ = self._runner(alive=False)
@@ -3079,6 +3158,51 @@ class TestCliSetup(_CliEnv):
             self.assertEqual(fh.read(), '{"chat_allowlist": ["7256243815"')
         self.assertEqual(config_mod.load()["chat_allowlist"], ["1"])
 
+    def test_setup_survives_a_config_it_cannot_even_read(self):
+        """`body` was bound inside the try, so a *read* failure fell through to
+        `fh.write(body)` and raised UnboundLocalError. `main()` does not catch,
+        and this runs after the plugin has already been disabled -- so the
+        cutover would be left with neither interface, in the exact scenario the
+        function was added to handle."""
+        config_mod.ensure_dirs()
+        cases = {}
+        with open(config_mod.config_path(), "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8")            # read() raises ValueError
+        cases["undecodable"] = None
+        path = self._settings()
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["1"]))
+        self.assertEqual(code, 0)
+        self.assertIn(config_mod.config_path(), err)
+        # Nothing could be read, so nothing is kept -- and nothing crashes.
+        self.assertFalse(os.path.exists(config_mod.config_path() + ".corrupt"))
+        self.assertEqual(config_mod.load()["chat_allowlist"], ["1"])
+
+    def test_setup_survives_a_config_it_is_not_allowed_to_read(self):
+        config_mod.ensure_dirs()
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('{"chat_allowlist": ["7256243815"')
+        os.chmod(config_mod.config_path(), 0o000)
+        self.addCleanup(lambda: os.path.exists(config_mod.config_path())
+                        and os.chmod(config_mod.config_path(), 0o600))
+        path = self._settings()
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["1"]))
+        self.assertEqual(code, 0)
+        self.assertIn("could not", err.lower())
+
+    def test_the_kept_copy_is_no_more_readable_than_the_config(self):
+        """It holds the same chat ids and repo paths, at the ambient umask."""
+        config_mod.ensure_dirs()
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('{"chat_allowlist": ["7256243815"')
+        os.chmod(config_mod.config_path(), 0o600)
+        path = self._settings()
+        self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["1"]))
+        kept = config_mod.config_path() + ".corrupt"
+        self.assertEqual(stat.S_IMODE(os.stat(kept).st_mode), 0o600)
+
     def test_setup_warns_when_it_writes_a_config_that_admits_nobody(self):
         """`--chat` is the whole authentication boundary, and setup is where a
         cutover would notice it was never passed."""
@@ -3483,12 +3607,58 @@ class TestChatAllowlist(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self._chat_mod().Chat(self.TOKEN, empty)
 
+    # Every shape a hand-edited config.json can hold, and what each must
+    # normalise to. `chat_allowlist` is typed by whoever edits the file, and
+    # the file is required to stay hand-repairable, so "wrong type" is an
+    # expected input rather than an impossible one.
+    SHAPES = [
+        ("7256243815", ["7256243815"]),      # one id, no brackets
+        (b"7256243815", ["7256243815"]),
+        (7256243815, ["7256243815"]),        # unquoted in JSON
+        (["7256243815"], ["7256243815"]),
+        (["7256243815", 42], ["7256243815", "42"]),
+        (("7256243815",), ["7256243815"]),
+        (True, []),                          # not an allowlist
+        (False, []),
+        ({"a": 1}, []),                      # would have iterated to ["a"]
+        (1.5, []),
+        (None, []),
+        ([], []),
+        ([None], []),                        # would have become ["None"]
+        (["", "   "], []),                   # non-empty, admitting nobody real
+    ]
+
+    def test_normalize_reduces_every_config_shape_to_ids(self):
+        """One normaliser, because there are three consumers and they must not
+        disagree about what a config value means."""
+        for value, expected in self.SHAPES:
+            self.assertEqual(
+                self._chat_mod().normalize_allowlist(value), expected, repr(value))
+
+    def test_normalize_never_raises(self):
+        """It runs at daemon startup, on a value a person typed. Raising there
+        is the cron crash-loop the NullChat fallback exists to prevent."""
+        class Awkward:
+            def __str__(self):
+                return "9"
+
+        for value in (object(), Awkward(), [Awkward()], set(), {"a": 1}.keys()):
+            self._chat_mod().normalize_allowlist(value)
+
     def test_a_single_id_written_as_a_string_is_not_read_as_digits(self):
         """`"chat_allowlist": "725..."` iterates into characters, and "7" is a
-        chat id someone could hold."""
+        chat id someone could hold. The production path is asserted in
+        `TestTwoLaneDaemon`; this is the constructor's own half."""
         chat = self._chat_mod().Chat(self.TOKEN, "7256243815")
         self.assertEqual(chat.allowlist, ["7256243815"])
         self.assertFalse(chat.allowed("7"))
+
+    def test_the_constructor_refuses_every_shape_that_names_nobody(self):
+        for value, expected in self.SHAPES:
+            if expected:
+                continue
+            with self.assertRaises(ValueError, msg=repr(value)):
+                self._chat_mod().Chat(self.TOKEN, value)
 
     def test_poll_drops_a_message_from_an_unlisted_chat(self):
         payload = {"result": [
@@ -3548,6 +3718,15 @@ class TestConfigIntegrity(unittest.TestCase):
             fh.write('["chat_allowlist"]')
         cfg, err = self._load()
         self.assertIn("not an object", err)
+        self.assertEqual(cfg["chat_allowlist"], [])
+
+    def test_a_config_that_is_literally_null_is_corruption_too(self):
+        """Valid JSON, and the one wrong shape that used to pass in silence --
+        `json.load` returns None and the old guard only checked non-None."""
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write("null")
+        cfg, err = self._load()
+        self.assertIn(config_mod.config_path(), err)
         self.assertEqual(cfg["chat_allowlist"], [])
 
     def test_a_readable_config_still_loads_and_still_takes_overrides(self):

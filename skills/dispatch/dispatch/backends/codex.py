@@ -114,7 +114,10 @@ def sandbox_args(config=None, resuming=False):
     ``resuming`` drops anything the ``resume`` subcommand does not accept.
     """
     mode = (config or {}).get("codex_sandbox") or DEFAULT_SANDBOX
-    args = SANDBOX_MODES.get(mode)
+    # `isinstance` first: a list or dict here is unhashable, and the lookup
+    # would raise TypeError inside the worker -- killing the step rather than
+    # the bad value.
+    args = SANDBOX_MODES.get(mode) if isinstance(mode, str) else None
     if args is None:
         print("warning: unknown codex_sandbox %r; using %s. Valid: %s"
               % (mode, DEFAULT_SANDBOX, ", ".join(sorted(SANDBOX_MODES))),

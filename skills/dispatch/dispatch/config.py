@@ -150,9 +150,11 @@ def load(overrides=None):
         _unreadable("%s: %s" % (type(exc).__name__, exc))
         loaded = None
     else:
-        if loaded is not None and not isinstance(loaded, dict):
+        if not isinstance(loaded, dict):
             # Valid JSON, wrong shape. `cfg.update` on a list raises, and on a
-            # string of two-character items silently invents keys.
+            # string of two-character items silently invents keys. A literal
+            # `null` is included: the file exists and says nothing, which is
+            # every bit as much a lost allowlist as a truncated write.
             _unreadable("top level is %s, not an object"
                         % type(loaded).__name__)
             loaded = None
