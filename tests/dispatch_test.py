@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import backends, governor, lanes, parser, scheduler, state, usage, winddown, worker  # noqa: E402
+from dispatch import backends, governor, lanes, parser, repos, scheduler, state, usage, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -805,6 +805,66 @@ class TestPromptFile(unittest.TestCase):
         self.assertNotIn("secret words", " ".join(recorded["argv"]))
         self.assertIsNotNone(recorded["stdin"])
         self.assertIn("secret words", recorded["stdin_content"])
+
+
+class TestRepoDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "Projects")
+        for name in ("qpay-backend", "poook", "notes"):
+            os.makedirs(os.path.join(self.root, name))
+        for name in ("qpay-backend", "poook"):
+            os.makedirs(os.path.join(self.root, name, ".git"))
+
+    def test_git_folders_are_dispatchable(self):
+        found = repos.discover(root=self.root)
+        self.assertTrue(found["qpay-backend"]["git"])
+        self.assertTrue(found["poook"]["git"])
+
+    def test_non_git_folders_are_listed_but_not_dispatchable(self):
+        found = repos.discover(root=self.root)
+        self.assertIn("notes", found)
+        self.assertFalse(found["notes"]["git"])
+        self.assertNotIn("notes", repos.dispatchable(found))
+
+    def test_resolve_refuses_a_non_git_folder(self):
+        self.assertIsNone(repos.resolve("notes", root=self.root))
+        self.assertIn("no git", repos.reject_reason("notes", repos.discover(root=self.root)))
+
+    def test_resolve_refuses_an_unknown_alias(self):
+        self.assertIsNone(repos.resolve("nope", root=self.root))
+        self.assertIn("unknown", repos.reject_reason("nope", repos.discover(root=self.root)))
+
+    def test_resolve_returns_the_path_for_a_git_folder(self):
+        self.assertEqual(repos.resolve("poook", root=self.root),
+                         os.path.join(self.root, "poook"))
+
+    def test_hidden_folders_are_ignored(self):
+        os.makedirs(os.path.join(self.root, ".cache"))
+        self.assertNotIn(".cache", repos.discover(root=self.root))
+
+    def test_files_are_ignored(self):
+        with open(os.path.join(self.root, "README.md"), "w") as fh:
+            fh.write("x")
+        self.assertNotIn("README.md", repos.discover(root=self.root))
+
+    def test_overrides_add_paths_outside_the_root(self):
+        outside = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(os.path.join(outside, ".git"))
+        found = repos.discover(root=self.root, overrides={"other": outside})
+        self.assertEqual(found["other"]["path"], outside)
+        self.assertTrue(found["other"]["git"])
+
+    def test_missing_root_is_empty_not_an_error(self):
+        self.assertEqual(repos.discover(root=os.path.join(self.tmp.name, "gone")), {})
+
+    def test_render_marks_what_cannot_be_dispatched(self):
+        text = repos.render(repos.discover(root=self.root))
+        self.assertIn("qpay-backend", text)
+        self.assertIn("notes", text)
+        self.assertIn("no git", text)
+        self.assertIn("3 folders", text)
 
 
 if __name__ == "__main__":

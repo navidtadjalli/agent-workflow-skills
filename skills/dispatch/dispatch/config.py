@@ -22,6 +22,9 @@ DEFAULTS = {
     "default_est_cost_pct": 6.0,
     # Chat.
     "chat_allowlist": [],
+    # Repos are discovered under this root; `repos` holds overrides only --
+    # aliases pointing somewhere else entirely.
+    "projects_root": "~/Projects",
     "repos": {},
 }
 

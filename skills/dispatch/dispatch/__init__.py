@@ -10,6 +10,7 @@ __all__ = [
     "config",
     "state",
     "lanes",
+    "repos",
     "usage",
     "governor",
     "scheduler",
