@@ -1,13 +1,20 @@
 """The daemon: one tick, repeated.
 
 Everything expensive or non-deterministic is injected -- clock, usage poll,
-token counter, chat transport, step runner, executor -- so the whole control
-loop can be driven step by step in a test with no network, no subprocesses, and
-no real time passing.
+token counter, codex reading, chat transport, step runner, executor -- so the
+whole control loop can be driven step by step in a test with no network, no
+subprocesses, and no real time passing.
 
 The loop never blocks on a task. A repo whose lock is held is simply not
 admissible this tick; a step that is still running is left alone. That is what
 lets intake keep answering while the plan window is exhausted.
+
+There are two lanes, one per agent, and they are independent in everything the
+tick does: each has its own governor reading, its own concurrency ladder, and
+its own wind-down machine, so an exhausted Claude window says nothing about
+whether codex may run. The single coupling is the per-repo lock, and it is
+deliberate: both lanes checkpoint to ``tg/<id>`` in the same checkout, so two
+workers in one repo would interleave commits and corrupt each other's work.
 """
 import concurrent.futures
 import json
@@ -17,7 +24,7 @@ import time
 
 from . import chat as chat_mod
 from . import config as config_mod
-from . import governor, lanes, parser, scheduler, state, usage, winddown
+from . import governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown
 
 PARSE_PROMPT = (
     "Convert this request into a JSON array of tasks. Each element must have "
@@ -42,12 +49,16 @@ class InlineExecutor:
 class Daemon:
     def __init__(self, config=None, clock=None, poll_usage=None, count_tokens=None,
                  chat=None, run_step=None, executor=None, freeform=None,
-                 checkpoint=None):
+                 checkpoint=None, codex_estimate=None):
         config_mod.ensure_dirs()
         self.config = config_mod.load(config)
         self.clock = clock or time.time
         self.poll_usage = poll_usage or (lambda: usage.poll(now=self.clock()))
         self.count_tokens = count_tokens or (lambda: usage.transcript_tokens(self.clock()))
+        # Free, unlike the Claude poll: codex writes the server's own limit
+        # block into its session logs, so this is a disk read on every tick.
+        self.codex_estimate = codex_estimate or (
+            lambda now: governor.codex.estimate(now))
         self.chat = chat if chat is not None else self._default_chat()
         self.run_step = run_step or self._default_run_step
         self.executor = executor or concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -76,10 +87,10 @@ class Daemon:
 
     def _default_freeform(self, text):
         """Ask a small model to split free-form intake into tasks."""
-        repos = ", ".join(sorted((self.config.get("repos") or {}).keys())) or "none configured"
+        repos_text = ", ".join(sorted(repos.dispatchable(self.found_repos()))) or "none"
         try:
             completed = subprocess.run(
-                ["claude", "-p", PARSE_PROMPT % (repos, text), "--output-format", "text"],
+                ["claude", "-p", PARSE_PROMPT % (repos_text, text), "--output-format", "text"],
                 capture_output=True, text=True, timeout=120)
         except Exception as exc:  # noqa: BLE001 - parsing must never kill the daemon
             return None, str(exc)
@@ -96,9 +107,29 @@ class Daemon:
 
     # -- helpers -----------------------------------------------------------
 
+    def found_repos(self):
+        return repos.discover(root=repos.root_path(self.config),
+                              overrides=self.config.get("repos"))
+
     def repo_path(self, repo):
-        """Resolve a repo alias. Unknown aliases are refused, not guessed."""
-        return (self.config.get("repos") or {}).get(repo)
+        """Resolve a repo name. Unknown or non-git names are refused."""
+        return repos.resolve(repo, found=self.found_repos())
+
+    def volume_block(self, now):
+        """The free token-volume report, with a total failure made visible.
+
+        ``volume`` skips a log it cannot read and carries on, which is right for
+        the one-shot report it was ported from and wrong for a process that
+        lives for weeks -- a corrupt file or a permissions problem would never
+        surface anywhere. Threading a diagnostics channel back out of it is more
+        than this reply needs, but the cheap half belongs here, at the one call
+        site: if the report cannot be produced at all, say so rather than
+        sending a usage message with a silent hole in it.
+        """
+        try:
+            return volume.render(now)
+        except Exception as exc:  # noqa: BLE001 - a bad log must not break `usage`
+            return "volume report unavailable: %s" % exc
 
     def notify(self, text):
         self.notices.append(text)
@@ -125,125 +156,187 @@ class Daemon:
             snapshot = governor.record_poll(snapshot, self.poll_usage(), tokens)
             self._force_poll = False
 
-        reading = governor.estimate(snapshot, now, tokens)
+        readings = {
+            lanes.CLAUDE: governor.estimate(snapshot, now, tokens),
+            lanes.CODEX: self.codex_estimate(now),
+        }
         # From here on the document is the single authority: a limit error
         # discovered while settling a step must not be overwritten by the
         # pre-settle snapshot.
         state_doc["governor"] = snapshot
 
-        # Settle anything that finished since the last tick, then decide the mode
-        # from the world as it is now.
-        if self._reap(state_doc, snapshot, reading):
+        # Settle anything that finished since the last tick, then decide each
+        # lane's mode from the world as it is now.
+        if self._reap(state_doc, snapshot):
             self._force_poll = True
-        mode = self._apply_mode(state_doc, snapshot, reading, now, tokens)
+        modes = self._apply_modes(state_doc, snapshot, readings, now, tokens)
 
-        self._intake(mode, reading, snapshot, now, tokens)
-        if mode == winddown.RUNNING:
-            self._dispatch(reading, now)
+        self._intake(modes, readings, snapshot, now, tokens)
+        for lane in lanes.ALL:
+            if modes[lane] == winddown.RUNNING:
+                self._dispatch(lane, readings[lane], now)
 
         # A step can also finish within this tick -- always with the inline
         # executor, occasionally with a fast real step. Settling it here rather
         # than a whole interval later keeps the queue moving.
-        if self._reap(state_doc, snapshot, reading):
+        if self._reap(state_doc, snapshot):
             self._force_poll = True
-            mode = self._apply_mode(state_doc, snapshot, reading, now, tokens)
+            modes = self._apply_modes(state_doc, snapshot, readings, now, tokens)
 
-        return {"mode": mode, "reading": reading, "running": sorted(self.running)}
+        return {"mode": modes, "readings": readings, "running": sorted(self.running)}
 
-    def _apply_mode(self, state_doc, snapshot, reading, now, tokens):
-        """Advance the wind-down state machine and persist the result.
+    def _apply_modes(self, state_doc, snapshot, readings, now, tokens):
+        """Advance each lane's wind-down machine and persist the result.
 
-        Bridge only -- this still drives the Claude lane alone. Task 9 gives
-        each lane its own wind-down; until then reads take the Claude lane and
-        writes fan out to both, so a state file with the old scalar shape
-        keeps loading and codex's half of the dict is never left stale.
+        Only the three fields the tick owns are written back. ``state_doc`` was
+        read before intake ran, and intake advances ``chat_offset`` through its
+        own read-modify-write -- writing this copy whole would rewind the chat
+        cursor and replay every command that arrived during the tick.
         """
-        mode = winddown.next_mode(state_doc["mode"][lanes.CLAUDE],
-                                  reading["session_pct"], len(self.running),
+        modes = dict(state_doc["mode"])
+        for lane in lanes.ALL:
+            modes[lane] = self._apply_lane_mode(
+                state_doc, lane, snapshot, readings[lane], now, tokens)
+        state_doc["mode"] = modes
+        with state.mutate_state() as doc:
+            doc["mode"] = modes
+            doc["armed_resume_at"] = dict(state_doc["armed_resume_at"])
+            doc["governor"] = state_doc["governor"]
+        return modes
+
+    def _apply_lane_mode(self, state_doc, lane, snapshot, reading, now, tokens):
+        """The same state machine as before, over one lane's tasks only."""
+        running = self._running_in(lane)
+        previous = state_doc["mode"][lane]
+        mode = winddown.next_mode(previous, reading["session_pct"], running,
                                   self.config, reading["stale"])
 
-        if mode == winddown.FROZEN and state_doc["mode"][lanes.CLAUDE] != winddown.FROZEN:
+        if mode == winddown.FROZEN and previous != winddown.FROZEN:
             armed = winddown.resume_at(reading.get("resets_at"))
-            state_doc["armed_resume_at"] = {lane: armed for lane in lanes.ALL}
-            self.notify("frozen at %s · %s" % (
-                governor.summary(snapshot, now, tokens),
-                "resumes ~%s" % self._reset_text(reading) if armed else "resume not scheduled"))
+            state_doc["armed_resume_at"][lane] = armed
+            self.notify("%s frozen at %s · %s" % (
+                lane, self._lane_summary(lane, snapshot, reading, now, tokens),
+                "resumes ~%s" % self._reset_text(reading) if armed else
+                "resume not scheduled"))
 
         if mode == winddown.FROZEN:
-            claude_armed = state_doc["armed_resume_at"][lanes.CLAUDE]
+            # can_resume predates per-lane modes and still expects the scalar
+            # shape, so it is handed this lane's two fields rather than the
+            # document they now live in.
             allowed, _ = winddown.can_resume(
-                dict(state_doc, mode=mode, armed_resume_at=claude_armed),
+                {"mode": mode, "armed_resume_at": state_doc["armed_resume_at"][lane]},
                 reading["session_pct"], now, self.config, reading["stale"])
             if allowed:
                 mode = winddown.RUNNING
-                state_doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
-                self.notify("resumed · %s" % governor.summary(snapshot, now, tokens))
-            elif (state_doc["armed_resume_at"][lanes.CLAUDE]
-                  and now >= state_doc["armed_resume_at"][lanes.CLAUDE]):
+                state_doc["armed_resume_at"][lane] = None
+                self.notify("%s resumed · %s" % (
+                    lane, self._lane_summary(lane, snapshot, reading, now, tokens)))
+            elif (state_doc["armed_resume_at"][lane]
+                  and now >= state_doc["armed_resume_at"][lane]):
                 # The timer fired but the window has not actually rolled over.
                 # Confirm with a real poll next tick rather than trusting it.
                 self._force_poll = True
-
-        state_doc["mode"] = {lane: mode for lane in lanes.ALL}
-        state.write(config_mod.state_path(), state_doc)
         return mode
+
+    def _running_in(self, lane):
+        return sum(1 for entry in self.running.values()
+                   if lanes.of(entry["task"]) == lane)
+
+    def _lane_summary(self, lane, snapshot, reading, now, tokens):
+        """One line about a lane, from whichever governor owns it."""
+        if lane == lanes.CLAUDE:
+            return governor.summary(snapshot, now, tokens)
+        parts = []
+        if reading.get("session_pct") is not None:
+            parts.append("5h %.0f%%" % reading["session_pct"])
+        if reading.get("week_pct") is not None:
+            parts.append("7d %.0f%%" % reading["week_pct"])
+        parts.append(reading.get("source") or "unknown")
+        return " · ".join(parts)
 
     # -- intake ------------------------------------------------------------
 
-    def _intake(self, mode, reading, snapshot, now, tokens):
+    def _intake(self, modes, readings, snapshot, now, tokens):
         state_doc = state.read_state()
         messages, next_offset = self.chat.poll(state_doc.get("chat_offset", 0))
         if next_offset != state_doc.get("chat_offset", 0):
             with state.mutate_state() as doc:
                 doc["chat_offset"] = next_offset
         for message in messages:
-            reply = self.handle_command(message["text"], mode, reading, snapshot,
+            reply = self.handle_command(message["text"], modes, readings, snapshot,
                                         now, tokens)
             if reply:
                 self.chat.send(message["chat_id"], reply)
 
-    def handle_command(self, text, mode, reading, snapshot, now, tokens):
+    def handle_command(self, text, modes, readings, snapshot, now, tokens):
         command = parser.parse(text)
         kind = command["kind"]
 
         if kind == "usage":
-            return governor.summary(snapshot, now, tokens)
+            return self.usage_reply(command.get("poll"), snapshot, readings,
+                                    now, tokens)
         if kind == "status":
-            return self.status_line(mode, snapshot, now, tokens)
+            return self.status_line(modes, snapshot, readings, now, tokens)
         if kind == "queue":
             return self.queue_line()
+        if kind == "sessions":
+            return sessions.render(now, project=command.get("project"))
+        if kind == "repos":
+            return repos.render(self.found_repos())
         if kind == "help":
             return ("claude <task> on <repo> · codex <task> on <repo> · "
                     "status · queue · usage · usage poll · sessions · repos · "
                     "logs <id> · cancel <id> · retry <id> · "
                     "pause [lane] · resume [lane]")
-        if kind == "pause":
-            with state.mutate_state() as doc:
-                doc["mode"] = {lane: "paused" for lane in lanes.ALL}
-            return "paused · in-flight step finishes, nothing new starts"
-        if kind == "resume":
-            with state.mutate_state() as doc:
-                doc["mode"] = {lane: winddown.RUNNING for lane in lanes.ALL}
-                doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
-            return "resumed"
+        if kind in ("pause", "resume"):
+            return self.set_mode(kind, command.get("lane"))
         if kind == "cancel":
             return self.cancel(command.get("id"))
         if kind == "logs":
             return self.logs(command.get("id"))
         if kind == "retry":
             return self.retry(command.get("id"))
+        if kind == "need_repo":
+            names = ", ".join(sorted(repos.dispatchable(self.found_repos()))) or "none"
+            return "need a repo · try: %s <task> on <repo> · dispatchable: %s" % (
+                command["agent"], names)
         if kind == "run":
+            # Through lanes.of, so an agent name nothing recognizes lands in the
+            # Claude lane rather than raising a KeyError on `modes`.
+            lane = lanes.of(command)
             return self.enqueue(command["repo"], command["prompt"],
-                                command.get("isolation", "repo"), mode, reading)
-        return self.enqueue_freeform(command.get("text", ""), mode, reading)
+                                command.get("isolation", "repo"),
+                                modes[lane], readings[lane], agent=lane)
+        reply = self.enqueue_freeform(command.get("text", ""),
+                                      modes[lanes.CLAUDE], readings[lanes.CLAUDE])
+        # An empty reply is indistinguishable from a dropped message, and a
+        # chat surface that sometimes says nothing is worse than one that says
+        # something useless. Every kind the parser emits lands somewhere.
+        return reply or "nothing to do · send `help` for what I understand"
 
-    def enqueue(self, repo, prompt, isolation, mode, reading):
-        if self.repo_path(repo) is None:
-            known = ", ".join(sorted((self.config.get("repos") or {}).keys())) or "none"
-            return "unknown repo '%s' · configured: %s" % (repo, known)
+    def set_mode(self, verb, lane):
+        """Pause or resume one lane, or both when none is named."""
+        targets = [lane] if lane else list(lanes.ALL)
+        value = "paused" if verb == "pause" else winddown.RUNNING
+        with state.mutate_state() as doc:
+            for target in targets:
+                doc["mode"][target] = value
+                if verb == "resume":
+                    doc["armed_resume_at"][target] = None
+        if verb == "pause":
+            return "paused %s · in-flight steps finish, nothing new starts" % (
+                ", ".join(targets))
+        return "resumed %s" % ", ".join(targets)
+
+    def enqueue(self, repo, prompt, isolation, mode, reading, agent="claude"):
+        found = self.found_repos()
+        if repos.resolve(repo, found=found) is None:
+            return repos.reject_reason(repo, found)
         with state.mutate_queue() as queue:
-            task = state.new_task(queue, repo, prompt, isolation=isolation)
-        return parser.render_ack(task["id"], mode, self._reset_text(reading))
+            task = state.new_task(queue, repo, prompt, isolation=isolation,
+                                  agent=agent)
+        return "%s · %s" % (parser.render_ack(task["id"], mode,
+                                              self._reset_text(reading)), agent)
 
     def enqueue_freeform(self, text, mode, reading):
         """Free-form intake. Never lost, even when the parse itself is blocked."""
@@ -263,7 +356,8 @@ class Daemon:
             return "stored %s · could not parse now (%s)" % (task["id"], error)
         ids = []
         for item in tasks:
-            reply = self.enqueue(item["repo"], item["prompt"], "repo", mode, reading)
+            reply = self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
+                                 agent=lanes.CLAUDE)
             if reply.startswith("queued"):
                 ids.append(reply.split()[1])
             else:
@@ -280,7 +374,8 @@ class Daemon:
                     state.find(queue, task["id"])["last_error"] = error
                 continue
             for item in tasks:
-                self.enqueue(item["repo"], item["prompt"], "repo", mode, reading)
+                self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
+                             agent=lanes.CLAUDE)
             with state.mutate_queue() as queue:
                 state.find(queue, task["id"])["state"] = "parsed"
         return len(pending)
@@ -322,49 +417,96 @@ class Daemon:
             return "no log for %s yet" % task_id
         return body[-limit:] if body else "log for %s is empty" % task_id
 
-    def status_line(self, mode, snapshot, now, tokens):
+    def usage_reply(self, poll, snapshot, readings, now, tokens):
+        """Free by default. Only an explicit `usage poll` spends a request."""
+        lines = []
+        if poll:
+            if not governor.should_poll(snapshot, now, force=True,
+                                        config=self.config):
+                lines.append("poll skipped · %ds floor since the last one"
+                             % self.config["poll_floor"])
+            else:
+                reading = self.poll_usage()
+                if reading.get("ok"):
+                    snapshot = governor.record_poll(snapshot, reading, tokens)
+                    with state.mutate_state() as doc:
+                        doc["governor"] = snapshot
+                    readings = dict(readings)
+                    readings[lanes.CLAUDE] = governor.estimate(snapshot, now, tokens)
+                    lines.append("polled · real numbers below")
+                else:
+                    lines.append("poll failed: %s" % reading.get("error"))
+
+        claude = readings[lanes.CLAUDE]
+        codex = readings[lanes.CODEX]
+        lines.append("CLAUDE  %s" % self._pct_line(claude))
+        polled_at = snapshot.get("polled_at")
+        if polled_at:
+            lines.append("        last real poll %dm ago" % ((now - polled_at) // 60))
+        lines.append("CODEX   %s" % self._pct_line(codex))
+        lines.append("")
+        lines.append(self.volume_block(now))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pct_line(reading):
+        if reading.get("session_pct") is None:
+            return "unknown"
+        parts = ["session %.0f%%" % reading["session_pct"]]
+        if reading.get("week_pct") is not None:
+            parts.append("week %.0f%%" % reading["week_pct"])
+        parts.append(reading.get("source") or "unknown")
+        return " · ".join(parts)
+
+    def status_line(self, modes, snapshot, readings, now, tokens):
         queue = state.read_queue()
         counts = {}
         for task in queue["tasks"]:
             counts[task["state"]] = counts.get(task["state"], 0) + 1
-        parts = [mode, governor.summary(snapshot, now, tokens)]
-        if counts:
-            parts.append(" ".join("%s %d" % kv for kv in sorted(counts.items())))
-        else:
-            parts.append("queue empty")
-        return " · ".join(parts)
+        lines = [
+            "claude  %s · %s" % (modes[lanes.CLAUDE],
+                                 self._pct_line(readings[lanes.CLAUDE])),
+            "codex   %s · %s" % (modes[lanes.CODEX],
+                                 self._pct_line(readings[lanes.CODEX])),
+            "queue   %s" % (" ".join("%s %d" % kv for kv in sorted(counts.items()))
+                            or "empty"),
+        ]
+        return "\n".join(lines)
 
     def queue_line(self, limit=10):
         tasks = state.read_queue()["tasks"]
         live = [t for t in tasks if t["state"] not in ("done", "cancelled", "parsed")]
         if not live:
             return "queue empty"
-        rows = ["%s %s %s (%d steps)" % (t["id"], t["state"], t["repo"], t["steps_done"])
-                for t in live[:limit]]
+        rows = ["%s %-6s %-11s %s (%d steps)" % (
+            t["id"], lanes.of(t), t["state"], t["repo"], t["steps_done"])
+            for t in live[:limit]]
         if len(live) > limit:
             rows.append("... %d more" % (len(live) - limit))
         return "\n".join(rows)
 
     # -- dispatch and reap -------------------------------------------------
 
-    def _dispatch(self, reading, now):
+    def _dispatch(self, lane, reading, now):
         while True:
             queue = state.read_queue()
             state_doc = state.read_state()
+            held = {entry["lock_name"] for entry in self.running.values()}
             ctx = {
-                "mode": state_doc["mode"][lanes.CLAUDE],
+                "mode": state_doc["mode"][lane],
                 "queue": queue,
-                "running": len(self.running),
+                "running": self._running_in(lane),
                 "session_pct": reading["session_pct"],
                 "week_pct": reading["week_pct"],
                 "stale": reading["stale"],
                 "config": self.config,
-                "lock_free": lambda name: name not in
-                {entry["lock_name"] for entry in self.running.values()},
+                # Shared across lanes on purpose: a codex worker and a claude
+                # worker must never hold the same checkout at once.
+                "lock_free": lambda name: name not in held,
                 "est_cost_pct": 0.0,
             }
             candidate = None
-            for task in scheduler.runnable(queue):
+            for task in scheduler.runnable(queue, lane):
                 ctx["est_cost_pct"] = governor.est_cost_pct(state_doc, task["repo"], self.config)
                 ok, _ = scheduler.admit(task, ctx)
                 if ok:
@@ -381,7 +523,7 @@ class Daemon:
             with state.mutate_queue() as queue:
                 record = state.find(queue, task["id"])
                 record["state"] = "blocked"
-                record["last_error"] = "repo path not configured or missing"
+                record["last_error"] = "repo is not dispatchable or has gone missing"
             return True
         name = scheduler.lock_name(task)
         handle = state.try_lock(name)
@@ -398,7 +540,7 @@ class Daemon:
         }
         return True
 
-    def _reap(self, state_doc, snapshot, reading):
+    def _reap(self, state_doc, snapshot):
         """Collect finished steps and decide each task's next state."""
         finished = []
         for task_id, entry in list(self.running.items()):
@@ -413,18 +555,22 @@ class Daemon:
                 result = {"status": None, "summary": "", "next": "",
                           "output": str(exc), "limit_reset_at": None,
                           "session_id": None, "timed_out": False}
-            self._settle(task_id, entry, result, state_doc, snapshot, reading)
+            self._settle(task_id, entry, result, state_doc, snapshot)
         return finished
 
-    def _settle(self, task_id, entry, result, state_doc, snapshot, reading):
+    def _settle(self, task_id, entry, result, state_doc, snapshot):
         task = entry["task"]
+        lane = lanes.of(task)
 
         if result.get("limit_reset_at"):
-            state_doc["governor"] = governor.note_limit_error(
-                state_doc.get("governor") or snapshot, result["limit_reset_at"])
-            state_doc["mode"] = {lane: winddown.FROZEN for lane in lanes.ALL}
-            state_doc["armed_resume_at"] = {
-                lane: winddown.resume_at(result["limit_reset_at"]) for lane in lanes.ALL}
+            # Only the Claude governor carries an override; the codex lane
+            # re-reads its own limits from disk next tick and self-corrects.
+            if lane == lanes.CLAUDE:
+                state_doc["governor"] = governor.note_limit_error(
+                    state_doc.get("governor") or snapshot, result["limit_reset_at"])
+            state_doc["mode"][lane] = winddown.FROZEN
+            state_doc["armed_resume_at"][lane] = winddown.resume_at(
+                result["limit_reset_at"])
 
         summary = (result.get("summary") or "").strip()
         message = "%s step %d: %s" % (task_id, task.get("steps_done", 0) + 1,
@@ -457,7 +603,7 @@ class Daemon:
                 record["last_error"] = "usage limit"
             else:
                 record["state"] = worker_next_state(result.get("status"),
-                                                    state_doc["mode"][lanes.CLAUDE])
+                                                    state_doc["mode"][lane])
                 if record["state"] == "failed":
                     record["last_error"] = "no status block from worker"
             settled = dict(record)
@@ -466,7 +612,8 @@ class Daemon:
             from . import worker as worker_mod
             worker_mod.write_handoff(directory, settled, result)
         if settled["state"] in ("done", "blocked", "failed", "cancelled"):
-            self.notify("%s %s · %s" % (task_id, settled["state"], summary or "-"))
+            self.notify("%s [%s] %s · %s" % (task_id, lane, settled["state"],
+                                             summary or "-"))
 
     # -- run loop ----------------------------------------------------------
 

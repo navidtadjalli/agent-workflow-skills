@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end dispatch pass against a stub agent CLI.
+"""End-to-end dispatch pass against stub agent CLIs.
 
-A fake `claude` on PATH stands in for the real one, so a full tick -- admit,
-run a step, parse the status block, checkpoint to the task branch, settle the
-task -- runs with no API call and no real usage. The clock and the plan reading
-are injected; only the subprocess and git are real.
+A fake `claude` and a fake `codex` on PATH stand in for the real ones, so a full
+tick -- admit, run a step, parse the status block, checkpoint to the task
+branch, settle the task -- runs with no API call and no real usage. The clock,
+both plan readings, and the chat transport are injected; only the subprocess and
+git are real. Each stub honours its own contract: `claude` takes the prompt on
+stdin and emits a fenced status block, `codex` writes its status JSON where `-o`
+points and announces its thread id on the event stream.
 """
 import os
 import subprocess
@@ -24,13 +27,27 @@ from dispatch import state  # noqa: E402
 STUB = """#!/usr/bin/env python3
 import json, os, sys
 mode = os.environ.get("STUB_MODE", "complete")
+prompt = sys.stdin.read()
 if mode == "limit":
     print("Claude AI usage limit reached|%s" % os.environ["STUB_RESET"])
     sys.exit(1)
 open(os.path.join(os.environ["STUB_REPO"], "worked.txt"), "a").write("step\\n")
-body = "did the work\\n```json\\n%s\\n```" % json.dumps(
-    {"status": mode, "summary": "stub step", "next": "more"})
+body = "prompt-was: %s\\n```json\\n%s\\n```" % (prompt.strip(), json.dumps(
+    {"status": mode, "summary": "stub step", "next": "more"}))
 print(json.dumps({"session_id": "sess-stub", "result": body}))
+"""
+
+CODEX_STUB = """#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+prompt = sys.stdin.read()
+out = argv[argv.index("-o") + 1]
+mode = os.environ.get("STUB_MODE", "complete")
+open(os.path.join(os.environ["STUB_REPO"], "worked.txt"), "a").write("codex\\n")
+with open(out, "w") as fh:
+    json.dump({"status": mode, "summary": "codex stub", "next": ""}, fh)
+print(json.dumps({"type": "thread.started", "thread_id": "codex-stub"}))
+print(json.dumps({"type": "item.done", "prompt_len": len(prompt)}))
 """
 
 
@@ -43,11 +60,14 @@ class DispatchIntegration(unittest.TestCase):
         bin_dir = os.path.join(root, "bin")
         os.makedirs(bin_dir)
         os.makedirs(self.repo)
+        # Repo discovery points here, so it never enumerates the real ~/Projects.
+        os.makedirs(os.path.join(root, "empty-root"))
 
-        stub_path = os.path.join(bin_dir, "claude")
-        with open(stub_path, "w") as fh:
-            fh.write(STUB)
-        os.chmod(stub_path, 0o755)
+        for name, body in (("claude", STUB), ("codex", CODEX_STUB)):
+            stub_path = os.path.join(bin_dir, name)
+            with open(stub_path, "w") as fh:
+                fh.write(body)
+            os.chmod(stub_path, 0o755)
 
         self._env = dict(os.environ)
         os.environ.update({
@@ -79,29 +99,46 @@ class DispatchIntegration(unittest.TestCase):
         return subprocess.run(["git"] + list(args), cwd=self.repo,
                               capture_output=True, text=True, check=False)
 
-    def _daemon(self, session_pct=10.0, **over):
+    def _daemon(self, session_pct=10.0, codex_pct=5.0, **over):
         reading = {"ok": True, "at": self.now, "session_pct": session_pct,
                    "session_reset": self.now + 7200, "week_pct": 5.0,
                    "week_reset": self.now + 500000}
         reading.update(over.pop("reading", {}))
+        codex_reading = {"session_pct": codex_pct, "week_pct": 0.0,
+                         "source": "codex-logs", "stale": False, "resets_at": None}
+        codex_reading.update(over.pop("codex_reading", {}))
         return daemon_mod.Daemon(
-            config={"repos": {"demo": self.repo}, "chat_allowlist": []},
+            # An empty projects root, so discovery never sees the real ~/Projects.
+            config={"projects_root": os.path.join(self.tmp.name, "empty-root"),
+                    "repos": {"demo": self.repo}, "chat_allowlist": []},
             clock=lambda: self.now,
             poll_usage=lambda: reading,
             count_tokens=lambda: 0,
+            codex_estimate=lambda now: codex_reading,
             chat=chat_mod.NullChat(),
             executor=daemon_mod.InlineExecutor(),
             **over)
 
-    def _enqueue(self, prompt="do the thing"):
+    def _enqueue(self, prompt="do the thing", agent="claude"):
         with state.mutate_queue() as queue:
-            return state.new_task(queue, "demo", prompt)
+            return state.new_task(queue, "demo", prompt, agent=agent)
+
+    def _modes(self, claude="running", codex="running"):
+        return {lanes.CLAUDE: claude, lanes.CODEX: codex}
+
+    def _readings(self, claude_pct=10.0, codex_pct=5.0, resets_at=None):
+        return {lanes.CLAUDE: {"session_pct": claude_pct, "week_pct": 5.0,
+                               "stale": False, "source": "measured",
+                               "resets_at": resets_at},
+                lanes.CODEX: {"session_pct": codex_pct, "week_pct": 0.0,
+                              "stale": False, "source": "codex-logs",
+                              "resets_at": None}}
 
     def test_step_runs_checkpoints_and_completes(self):
         task = self._enqueue()
         result = self._daemon().tick()
 
-        self.assertEqual(result["mode"], "running")
+        self.assertEqual(result["mode"][lanes.CLAUDE], "running")
         settled = state.find(state.read_queue(), task["id"])
         self.assertEqual(settled["state"], "done")
         self.assertEqual(settled["steps_done"], 1)
@@ -150,7 +187,7 @@ class DispatchIntegration(unittest.TestCase):
     def test_soft_limit_stops_new_dispatch(self):
         task = self._enqueue()
         result = self._daemon(session_pct=90.0).tick()
-        self.assertEqual(result["mode"], "frozen")
+        self.assertEqual(result["mode"][lanes.CLAUDE], "frozen")
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "queued")
         self.assertIsNotNone(state.read_state()["armed_resume_at"][lanes.CLAUDE])
 
@@ -159,7 +196,7 @@ class DispatchIntegration(unittest.TestCase):
         # 82% + the 6% default step estimate lands past the 85% soft limit,
         # while staying below it, so the mode is still running.
         result = self._daemon(session_pct=82.0).tick()
-        self.assertEqual(result["mode"], "running")
+        self.assertEqual(result["mode"][lanes.CLAUDE], "running")
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "queued")
 
     def test_usage_limit_error_freezes_and_pauses_the_task(self):
@@ -197,30 +234,94 @@ class DispatchIntegration(unittest.TestCase):
 
     def test_unknown_repo_is_refused_not_guessed(self):
         daemon = self._daemon()
-        reply = daemon.handle_command("run something on nowhere", "running",
-                                      {"session_pct": 10.0, "week_pct": 5.0,
-                                       "stale": False, "resets_at": None},
+        reply = daemon.handle_command("run something on nowhere", self._modes(),
+                                      self._readings(),
                                       daemon_mod.governor.blank(), self.now, 0)
         self.assertIn("unknown repo", reply)
         self.assertEqual(state.read_queue()["tasks"], [])
 
     def test_chat_run_command_enqueues(self):
         daemon = self._daemon()
-        reply = daemon.handle_command("run the migration on demo", "running",
-                                      {"session_pct": 10.0, "week_pct": 5.0,
-                                       "stale": False, "resets_at": None},
+        reply = daemon.handle_command("run the migration on demo", self._modes(),
+                                      self._readings(),
                                       daemon_mod.governor.blank(), self.now, 0)
         self.assertTrue(reply.startswith("queued t-0001"))
         self.assertEqual(state.read_queue()["tasks"][0]["prompt"], "the migration")
 
     def test_freeform_while_frozen_is_stored_not_lost(self):
         daemon = self._daemon()
-        reply = daemon.handle_command("please tidy up the deps everywhere", "frozen",
-                                      {"session_pct": 99.0, "week_pct": 5.0,
-                                       "stale": False, "resets_at": self.now + 60},
+        reply = daemon.handle_command("please tidy up the deps everywhere",
+                                      self._modes(claude="frozen"),
+                                      self._readings(claude_pct=99.0,
+                                                     resets_at=self.now + 60),
                                       daemon_mod.governor.blank(), self.now, 0)
         self.assertIn("stored", reply)
         self.assertEqual(state.read_queue()["tasks"][0]["state"], "needs_parse")
+
+    def test_prompt_reaches_the_agent_on_stdin(self):
+        """End-to-end proof that the prompt file is plumbed to stdin."""
+        task = self._enqueue("plant this exact phrase")
+        self._daemon().tick()
+        with open(os.path.join(config_mod.task_dir(task["id"]), "worker.log")) as fh:
+            log = fh.read()
+        self.assertIn("prompt-was: plant this exact phrase", log)
+        prompt_file = os.path.join(config_mod.task_dir(task["id"]), "prompt.txt")
+        self.assertTrue(os.path.exists(prompt_file))
+        with open(prompt_file) as fh:
+            self.assertIn("Never push", fh.read())
+
+    def test_codex_task_runs_through_its_own_backend(self):
+        task = self._enqueue("codex work", agent="codex")
+        self._daemon().tick()
+        settled = state.find(state.read_queue(), task["id"])
+        self.assertEqual(settled["state"], "done")
+        self.assertEqual(settled["session_id"], "codex-stub")
+        self.assertIn("tg/t-0001", self._git("branch", "--list", "tg/t-0001").stdout)
+
+    def test_codex_lane_runs_while_the_claude_lane_is_frozen(self):
+        self._enqueue("claude work", agent="claude")
+        self._enqueue("codex work", agent="codex")
+        result = self._daemon(session_pct=99.0, codex_pct=5.0).tick()
+        tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
+        self.assertEqual(tasks["t-0002"]["state"], "done")
+        self.assertIn(tasks["t-0001"]["state"], ("queued", "paused"))
+        self.assertIn(result["mode"]["claude"], ("winding-down", "frozen"))
+        self.assertEqual(result["mode"]["codex"], "running")
+
+    def test_lanes_contend_for_one_repo(self):
+        """A claude worker and a codex worker must not share a checkout."""
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("first", agent="claude")
+        self._enqueue("second", agent="codex")
+        daemon = self._daemon()
+        started = []
+        original = daemon.run_step
+
+        def watched(task, cwd):
+            started.append(task["id"])
+            return original(task, cwd)
+
+        daemon.run_step = watched
+        daemon.tick()
+        self.assertEqual(started, ["t-0001"])
+
+    def test_codex_admitted_on_a_stale_but_unexpired_reading(self):
+        """A codex percentage is only as fresh as the last codex run, and waiting
+        cannot improve it -- so age alone must never block the lane."""
+        task = self._enqueue("codex work", agent="codex")
+        daemon = self._daemon(codex_reading={
+            "session_pct": 20.0, "week_pct": 0.0, "source": "codex-logs",
+            "stale": False, "resets_at": self.now + 60})
+        daemon.tick()
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "done")
+
+    def test_no_codex_reading_at_all_still_admits(self):
+        task = self._enqueue("codex work", agent="codex")
+        daemon = self._daemon(codex_reading={
+            "session_pct": 0.0, "week_pct": None, "source": "codex-unknown",
+            "stale": False, "resets_at": None})
+        daemon.tick()
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "done")
 
     def test_cli_status_and_queue_run_against_the_same_state(self):
         self._enqueue()

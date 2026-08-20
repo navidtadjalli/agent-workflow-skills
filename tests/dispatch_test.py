@@ -1221,5 +1221,270 @@ class TestSessions(unittest.TestCase):
         self.assertFalse(hasattr(sessions, "launch"))
 
 
+class TestTwoLaneDaemon(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._previous = os.environ.get("DISPATCH_HOME")
+        os.environ["DISPATCH_HOME"] = os.path.join(self.tmp.name, "home")
+        self.addCleanup(self._restore)
+        self.projects = os.path.join(self.tmp.name, "Projects")
+        for name in ("qpay", "poook"):
+            os.makedirs(os.path.join(self.projects, name, ".git"))
+        self.logs = os.path.join(self.tmp.name, "empty-logs")
+        os.makedirs(self.logs)
+        self.now = 1_800_000_000.0
+
+    def _restore(self):
+        if self._previous is None:
+            os.environ.pop("DISPATCH_HOME", None)
+        else:
+            os.environ["DISPATCH_HOME"] = self._previous
+
+    def _daemon(self, claude_pct=10.0, codex_pct=10.0, run_step=None):
+        from dispatch import chat as chat_mod
+        from dispatch import daemon as daemon_mod
+        daemon = daemon_mod.Daemon(
+            config={"projects_root": self.projects, "chat_allowlist": ["1"]},
+            clock=lambda: self.now,
+            poll_usage=lambda: {"ok": True, "at": self.now,
+                                "session_pct": claude_pct, "session_reset": self.now + 3600,
+                                "week_pct": 5.0, "week_reset": self.now + 86400},
+            count_tokens=lambda: 0,
+            codex_estimate=lambda now: {
+                "session_pct": codex_pct, "week_pct": 0.0,
+                "source": "codex-logs", "stale": False, "resets_at": None},
+            chat=chat_mod.NullChat(),
+            run_step=run_step or (lambda task, cwd: {
+                "status": "complete", "summary": "ok", "next": "",
+                "output": "", "limit_reset_at": None, "session_id": None,
+                "timed_out": False}),
+            executor=daemon_mod.InlineExecutor())
+        # The volume report globs whole log trees. Point it at an empty one so
+        # no test reads the developer's real ~/.claude or ~/.codex.
+        daemon.volume_block = lambda now: volume.render(
+            now, claude_root=self.logs, codex_root=self.logs)
+        self.addCleanup(self._release_locks, daemon)
+        return daemon
+
+    @staticmethod
+    def _release_locks(daemon):
+        """A reap drops a worker's repo lock. Tests that never reap drop it here."""
+        for entry in daemon.running.values():
+            state.release(entry["lock"])
+        daemon.running.clear()
+
+    def test_tick_returns_a_mode_per_lane(self):
+        result = self._daemon().tick()
+        self.assertEqual(set(result["mode"]), {"claude", "codex"})
+
+    def test_a_frozen_claude_lane_still_dispatches_codex(self):
+        started = []
+        daemon = self._daemon(claude_pct=99.0, codex_pct=5.0,
+                              run_step=lambda task, cwd: started.append(task["id"]) or {
+                                  "status": "complete", "summary": "", "next": "",
+                                  "output": "", "limit_reset_at": None,
+                                  "session_id": None, "timed_out": False})
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "claude work", agent="claude")
+            state.new_task(queue, "poook", "codex work", agent="codex")
+        daemon.tick()
+        tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
+        self.assertEqual(tasks["t-0002"]["state"], "done")
+        self.assertIn(tasks["t-0001"]["state"], ("queued", "paused"))
+
+    def test_the_repo_lock_is_shared_between_lanes(self):
+        """Two tasks on one repo must not run in the same tick."""
+        started = []
+
+        def run_step(task, cwd):
+            started.append(task["id"])
+            return {"status": "continue", "summary": "", "next": "", "output": "",
+                    "limit_reset_at": None, "session_id": None, "timed_out": False}
+
+        daemon = self._daemon(run_step=run_step)
+        daemon.executor = _NeverFinishes()
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "a", agent="claude")
+            state.new_task(queue, "qpay", "b", agent="codex")
+        daemon.tick()
+        self.assertEqual(len(daemon.running), 1)
+
+    def test_a_busy_repo_does_not_stall_the_rest_of_the_lane(self):
+        """The shared lock is an admission check, not a failed start.
+
+        A codex task blocked by a claude worker has to be stepped over, so the
+        next codex task in the queue still gets its turn this tick. Letting it
+        reach `_start` and fail on the flock would end the lane's dispatch pass.
+        """
+        daemon = self._daemon()
+        daemon.executor = _NeverFinishes()
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "claude holds this repo", agent="claude")
+            state.new_task(queue, "qpay", "codex wants the same repo", agent="codex")
+            state.new_task(queue, "poook", "codex elsewhere", agent="codex")
+        daemon.tick()
+        self.assertEqual(sorted(daemon.running), ["t-0001", "t-0003"])
+
+    def test_unknown_repo_is_refused_with_the_dispatchable_list(self):
+        daemon = self._daemon()
+        reply = daemon.handle_command(
+            "claude do a thing on nope", {"claude": "running", "codex": "running"},
+            {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                        "source": "measured", "resets_at": None},
+             "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                       "source": "codex-logs", "resets_at": None}},
+            governor.blank(), self.now, 0)
+        self.assertIn("unknown repo", reply)
+        self.assertIn("qpay", reply)
+
+    def test_bare_agent_verb_is_refused_with_the_repo_list(self):
+        daemon = self._daemon()
+        reply = daemon.handle_command(
+            "claude fix the auth test", {"claude": "running", "codex": "running"},
+            {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                        "source": "measured", "resets_at": None},
+             "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                       "source": "codex-logs", "resets_at": None}},
+            governor.blank(), self.now, 0)
+        self.assertIn("need a repo", reply)
+        self.assertIn("qpay", reply)
+
+    def test_codex_verb_enqueues_into_the_codex_lane(self):
+        daemon = self._daemon()
+        daemon.executor = _NeverFinishes()
+        daemon.handle_command(
+            "codex bump deps on poook", {"claude": "running", "codex": "running"},
+            {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                        "source": "measured", "resets_at": None},
+             "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                       "source": "codex-logs", "resets_at": None}},
+            governor.blank(), self.now, 0)
+        self.assertEqual(state.read_queue()["tasks"][0]["agent"], "codex")
+
+    def test_pause_one_lane_leaves_the_other_running(self):
+        daemon = self._daemon()
+        modes = {"claude": "running", "codex": "running"}
+        readings = {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                               "source": "measured", "resets_at": None},
+                    "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                              "source": "codex-logs", "resets_at": None}}
+        daemon.handle_command("pause codex", modes, readings,
+                              governor.blank(), self.now, 0)
+        doc = state.read_state()
+        self.assertEqual(doc["mode"]["codex"], "paused")
+        self.assertEqual(doc["mode"]["claude"], "running")
+
+    def test_usage_without_poll_spends_nothing(self):
+        polled = []
+        daemon = self._daemon()
+        daemon.poll_usage = lambda: polled.append(1) or {"ok": False}
+        readings = {"claude": {"session_pct": 41.0, "week_pct": 62.0, "stale": False,
+                               "source": "projected", "resets_at": None},
+                    "codex": {"session_pct": 12.0, "week_pct": 100.0, "stale": False,
+                              "source": "codex-logs", "resets_at": None}}
+        reply = daemon.usage_reply(False, governor.blank(), readings, self.now, 0)
+        self.assertEqual(polled, [])
+        self.assertIn("41", reply)
+        self.assertIn("12", reply)
+
+    def test_usage_poll_respects_the_floor(self):
+        daemon = self._daemon()
+        polled = []
+        daemon.poll_usage = lambda: polled.append(1) or {
+            "ok": True, "at": self.now, "session_pct": 44.0,
+            "session_reset": self.now + 60, "week_pct": 1.0, "week_reset": None}
+        snapshot = dict(governor.blank(), polled_at=self.now - 5,
+                        session_pct=40.0, tokens_at_poll=0)
+        readings = {"claude": governor.estimate(snapshot, self.now, 0),
+                    "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                              "source": "codex-logs", "resets_at": None}}
+        reply = daemon.usage_reply(True, snapshot, readings, self.now, 0)
+        self.assertEqual(polled, [])
+        self.assertIn("floor", reply)
+
+    def test_every_parser_kind_gets_a_reply(self):
+        """Silence is the worst reply a chat surface can give.
+
+        An empty reply is indistinguishable from a dropped message, so every
+        kind the parser can emit -- including the ones that carry no ``text``
+        and used to fall through to free-form intake -- must answer with
+        something.
+        """
+        samples = ["status", "queue", "usage", "usage poll", "help", "repos",
+                   "sessions", "sessions qpay", "pause", "resume", "pause codex",
+                   "resume claude", "cancel 1", "logs 1", "retry 1",
+                   "claude fix the auth test", "claude tidy up on qpay",
+                   "run the migration on qpay", "hello there", "", "   "]
+        expected = {"status", "queue", "usage", "help", "repos", "sessions",
+                    "pause", "resume", "cancel", "logs", "retry", "need_repo",
+                    "run", "unparsed"}
+        covered = {parser.parse(text)["kind"] for text in samples}
+        self.assertEqual(covered, expected)
+        self.assertTrue(set(parser.BARE.values()) <= expected)
+
+        daemon = self._daemon()
+        daemon.freeform = lambda text: (None, "no model in tests")
+        modes = {"claude": "running", "codex": "running"}
+        readings = {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                               "source": "measured", "resets_at": None},
+                    "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                              "source": "codex-logs", "resets_at": None}}
+        with mock.patch.object(sessions, "render", return_value="no sessions found"):
+            for text in samples:
+                reply = daemon.handle_command(text, modes, readings,
+                                              governor.blank(), self.now, 0)
+                self.assertTrue(reply, "empty reply for %r" % text)
+                self.assertIsInstance(reply, str)
+
+    def test_chat_offset_survives_a_step_settling_in_the_same_tick(self):
+        """The tick's state document is read before intake runs.
+
+        Writing that copy back whole after a step settles would rewind the chat
+        cursor to where it stood at the top of the tick, and every command in
+        the batch would be replayed on the next poll.
+        """
+        daemon = self._daemon()
+        daemon.chat = _ScriptedChat("status", update_id=7)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        self.assertEqual(state.read_state()["chat_offset"], 8)
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "done")
+
+
+class _NeverFinishes:
+    """Executor whose futures stay pending, so `running` survives the tick."""
+
+    def submit(self, fn, *args, **kwargs):
+        import concurrent.futures
+        return concurrent.futures.Future()
+
+    def shutdown(self, wait=True):
+        return None
+
+
+class _ScriptedChat:
+    """Delivers one message once, then goes quiet. Records what was sent back."""
+
+    def __init__(self, text, update_id):
+        self.text = text
+        self.next_offset = update_id + 1
+        self.sent = []
+
+    def allowed(self, chat_id):
+        return True
+
+    def poll(self, offset):
+        if offset >= self.next_offset:
+            return [], offset
+        return [{"chat_id": "1", "text": self.text}], self.next_offset
+
+    def send(self, chat_id, text):
+        self.sent.append((chat_id, text))
+        return True
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
