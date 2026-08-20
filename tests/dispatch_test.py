@@ -1752,6 +1752,33 @@ class TestTwoLaneDaemon(unittest.TestCase):
         freezes = [n for n in daemon.notices if "frozen" in n]
         self.assertEqual(len(freezes), 1, daemon.notices)
 
+    def test_a_week_frozen_lane_returns_to_running_when_the_week_resets(self):
+        """The other half of the freeze: it has to end. Frozen is only left
+        through `can_resume`, which now also consults the week."""
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "poook", "codex work", agent="codex")
+        daemon.tick()
+        self.assertEqual(state.read_state()["mode"][lanes.CODEX], winddown.FROZEN)
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "queued")
+
+        # The week rolls over: the armed timer has passed and codex's own logs
+        # now report a fresh window.
+        self.now += 86400 + winddown.RESUME_DELAY + 1
+        daemon.codex_estimate = lambda now: {
+            "session_pct": 1.0, "session_known": True, "week_pct": 2.0,
+            "source": "codex-logs", "stale": False, "resets_at": None,
+            "week_resets_at": None}
+        result = daemon.tick()
+
+        self.assertEqual(result["mode"][lanes.CODEX], winddown.RUNNING)
+        self.assertIsNone(state.read_state()["armed_resume_at"][lanes.CODEX])
+        self.assertTrue(any("codex resumed" in notice for notice in daemon.notices),
+                        daemon.notices)
+        # Recovered to the point of actually dispatching, not just to a label.
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "done")
+
     def test_a_week_frozen_claude_lane_does_not_re_poll_every_tick(self):
         """The armed timer fires on the session reset, which cannot help: only
         the week rolling over can, and the idle cadence already covers that."""
@@ -2019,6 +2046,50 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self._stored("second")
         daemon.tick()
         self.assertEqual(seen, ["first"])
+
+    def test_a_stored_message_whose_repo_does_not_resolve_is_not_dropped(self):
+        """`enqueue` returns its rejection as a string; it neither raises nor
+        queues. Discarding it marked the stored text `parsed` with nothing
+        queued and nothing said -- and `queue` hides `parsed` by default, so
+        the request was gone from every surface after "parsed after reset"."""
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "first"},
+                                         {"repo": "typo-repo", "prompt": "second"}],
+                                        None)
+        self._stored()
+        daemon.tick()
+        tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
+        stored = tasks["t-0001"]
+        self.assertEqual(stored["state"], "blocked")
+        self.assertIn("unknown repo", stored["last_error"])
+        self.assertTrue(any("t-0001 blocked" in notice for notice in daemon.notices),
+                        daemon.notices)
+        self.assertTrue(any("typo-repo" in notice for notice in daemon.notices),
+                        daemon.notices)
+        # What did resolve is kept, and the notice says so rather than leaving
+        # the user to discover a half-applied parse.
+        self.assertEqual(tasks["t-0002"]["prompt"], "first")
+        self.assertTrue(any("t-0002" in notice for notice in daemon.notices),
+                        daemon.notices)
+
+    def test_a_stored_message_with_no_usable_repo_at_all_queues_nothing(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "typo-repo", "prompt": "x"}], None)
+        self._stored()
+        daemon.tick()
+        tasks = state.read_queue()["tasks"]
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["state"], "blocked")
+        self.assertIn("dispatchable", tasks[0]["last_error"])
+
+    def test_a_stored_message_that_parses_cleanly_still_settles_parsed(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "ok"}], None)
+        self._stored()
+        daemon.tick()
+        stored = state.read_queue()["tasks"][0]
+        self.assertEqual(stored["state"], "parsed")
+        self.assertIsNone(stored["last_error"])
 
     def test_a_parse_that_keeps_failing_is_handed_back_not_retried_forever(self):
         from dispatch import daemon as daemon_mod

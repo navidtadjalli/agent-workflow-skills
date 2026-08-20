@@ -5,8 +5,18 @@
 `dispatch setup` writes config. It starts nothing -- `dispatch up` does that --
 but it does make one edit outside its own state: it turns off the in-session
 chat plugin that owns the same bot, because two consumers polling one bot get
-409s. Your `settings.json` is copied to `settings.json.bak` first and exactly
-one boolean changes. Pass `--keep-plugin` to be warned instead of edited.
+409s. Your `settings.json` is copied verbatim to `settings.json.bak` first, and
+one entry changes: `enabledPlugins` is either a map, in which case the plugin's
+boolean becomes `false`, or a list, in which case the plugin's entry is removed.
+Nothing else in the file is touched, and the original key order is kept.
+
+**Setup exits non-zero if the plugin is still enabled when it finishes.** It
+still writes the config and prints every warning first -- only the verdict
+changes. One token admits exactly one consumer, so starting the daemon in that
+state produces a bot that 409s on every poll while `status`, `queue`, tmux and
+the watchdog all stay green. Turn the plugin off by hand and re-run.
+Pass `--keep-plugin` to be warned instead of edited; that is a deliberate
+choice, and it still exits 0.
 
 ```bash
 dispatch setup --repo qpay=~/Projects/qpay-backend --chat <chat-id>
@@ -18,12 +28,26 @@ dispatch logs --daemon   # what the daemon is saying right now
 State lives under `~/.claude/dispatch/` (override with `DISPATCH_HOME`):
 
 ```
-config.json   thresholds, repo aliases, chat allowlist
+config.json   thresholds, repo overrides, chat allowlist, projects root
 queue.json    tasks
-state.json    governor snapshot, chat offset, mode, armed resume
+state.json    governor snapshot · chat offset · per-lane mode and armed resume
+              · chat transport health (last error, consecutive failures, when)
+              · hold_reason: why each lane last started nothing
+              · repo_cost_pct (reserved; nothing writes it yet)
+daemon.log    tracebacks the tmux pane cannot keep, plus startup failures;
+daemon.log.1  rolls over once at 1MB
 locks/        flock files, one per repo or isolated worktree
-tasks/<id>/   task.md · steps.jsonl · worker.log · handoff.md
+tasks/<id>/   prompt.txt · steps.jsonl · worker.log · handoff.md
+              · last.json (codex only; cleared before every step, so a
+                step that dies cannot be read as the previous one)
 ```
+
+`daemon.log` is the one that matters after a crash: the tmux session dies with
+the daemon and takes its scrollback with it, so `logs --daemon` falls back to
+this file when there is no pane left to read.
+
+The chat-health fields never contain the bot token -- the transport redacts it
+out of any error message before recording it.
 
 The bot token is never copied here. It is read at runtime from the channel env
 file.
@@ -69,7 +93,8 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | `usage unknown (never polled)` | No successful poll yet | `dispatch usage --poll` |
 | Task stuck `running`, no process | Daemon died mid-step | Restart the daemon; the lock is released with the process, then `dispatch cancel` and re-add |
 | Task `failed`, log looks complete | Worker omitted its status block | `dispatch logs <id>`, then re-add with the acceptance restated |
-| Everything `blocked` on one repo | Repo path missing from config | Re-run `dispatch setup --repo alias=path` |
+| Everything `blocked` on one repo | The folder lost its `.git`, or was renamed or moved out of the projects root | `repos` in chat lists what is dispatchable; a repo outside the root needs `dispatch setup --repo alias=path` |
+| A stored free-form message came back `blocked` | It parsed to a repo that is not dispatchable; nothing, or only part, was queued -- the notice says which | Re-send it as `claude <task> on <repo>` |
 | Mode stays `frozen` past the reset | Reset time was misparsed | `dispatch usage --poll`, then `dispatch resume` |
 | A lane reads `frozen` with a low session percentage | Its weekly window is at or above the soft limit | Nothing: it resumes when the week resets. `dispatch status` shows both windows |
 | The bot answers nothing, everything else looks healthy | Chat transport is failing | `dispatch status` prints the last transport error and how many polls have failed in a row |

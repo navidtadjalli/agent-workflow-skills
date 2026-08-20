@@ -193,8 +193,8 @@ correct behaviour and must not be read as a defect.
 ## Chat surface
 
 The parser gains two run verbs and two read verbs. Both run verbs require an
-explicit repo -- a bare `claude <prompt>` is rejected with the alias list rather
-than defaulting anywhere. Workers run without permission prompts, so "which
+explicit repo -- a bare `claude <prompt>` is rejected with the dispatchable
+list rather than defaulting anywhere. Workers run without permission prompts, so "which
 repository" is a safety question, and guessing is the wrong answer.
 
 ```
@@ -304,13 +304,26 @@ Ordered, because one Telegram token admits exactly one consumer.
 
 1. `dispatch setup --chat 7256243815`
 2. remove the health cron line
-3. `telegram@claude-plugins-official` -> `false` in `~/.claude/settings.json`
-4. kill the running bridge processes
-5. `dispatch up`
-6. verify by sending `status` from Telegram
-7. install the two watchdog cron entries
+3. kill the running bridge processes
+4. `dispatch up`
+5. verify by sending `status` from Telegram
+6. install the two watchdog cron entries
 
-Deleted once step 6 passes:
+**Step 1 now disables the plugin itself, and the separate manual step for it is
+gone.** It was step 3, and leaving it there would have made this sequence abort
+before reaching it: `setup` turns `telegram@claude-plugins-official` off (it
+handles both the map and the list form of `enabledPlugins`, backing the file up
+verbatim first) and **exits non-zero if it could not**, so under `set -e` the
+script stops at step 1 -- ahead of a manual fallback written to run at step 3.
+
+Dropped rather than moved ahead of step 1, deliberately: `disable_plugin` copies
+the original bytes to `settings.json.bak` before editing and renames the new
+content into place over `realpath`, so a symlinked `settings.json` stays a
+symlink and a crash mid-write cannot truncate it. A hand edit gets none of that.
+If step 1 does exit non-zero it has already said which file it could not change;
+turn the plugin off by hand then, and re-run step 1 before continuing.
+
+Deleted once step 5 passes:
 
 ```
 ~/.claude/scripts/telegram_health.sh

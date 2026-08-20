@@ -525,11 +525,37 @@ class Daemon:
                                 "attempts (%s) · send it again as `claude "
                                 "<task> on <repo>`" % (task["id"], attempts, error))
                 continue
+            # `enqueue` reports a repo it cannot resolve by *returning* the
+            # reason -- it neither raises nor queues. Discarding that marked
+            # the stored text `parsed` with nothing queued and nothing said,
+            # and `queue` hides `parsed` by default: the request the user was
+            # promised would be "parsed after reset" disappeared from every
+            # surface. A folder renamed between the store and the parse is all
+            # it takes; the parse prompt constrains the model to the
+            # dispatchable list but cannot make it obey.
+            queued, rejected = [], None
             for item in tasks:
-                self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
-                             agent=lanes.CLAUDE)
+                reply = self.enqueue(item["repo"], item["prompt"], "repo", mode,
+                                     reading, agent=lanes.CLAUDE)
+                if reply.startswith("queued"):
+                    queued.append(reply.split()[1])
+                else:
+                    rejected = reply
+                    break
             with state.mutate_queue() as queue:
-                state.find(queue, task["id"])["state"] = "parsed"
+                record = state.find(queue, task["id"])
+                if record is not None:
+                    record["state"] = "blocked" if rejected else "parsed"
+                    record["last_error"] = rejected
+            if rejected:
+                # Blocked rather than left to retry: whatever came before the
+                # rejection is already queued, and re-parsing the same text
+                # would queue it a second time. One honest failure beats
+                # duplicate unattended work.
+                self.notify("%s blocked · %s%s" % (
+                    task["id"], rejected,
+                    " · queued %s before that" % ", ".join(queued) if queued
+                    else " · nothing queued"))
         return len(pending)
 
     # -- queue operations --------------------------------------------------
