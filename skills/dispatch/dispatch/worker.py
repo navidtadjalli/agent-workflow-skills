@@ -152,14 +152,22 @@ def checkpoint(task, cwd, message, runner=None):
             "error": (commit.stderr or "").strip() or None}
 
 
-def write_handoff(task_dir, task, result):
-    """The note a fresh worker reads when the original session id is gone."""
+def write_handoff(task_dir, task, result, cwd=None):
+    """The note a fresh worker reads when the original session id is gone.
+
+    ``cwd`` is the directory the step actually ran in. For an isolated task
+    that is a worktree rather than the repository itself, and this note is the
+    only place that records which -- the states this file is written for
+    (``paused``, ``blocked``, ``failed``) are exactly the states whose worktree
+    is kept so that someone can go and look at it.
+    """
     os.makedirs(task_dir, exist_ok=True)
     lines = [
         "# Handoff for %s" % task["id"],
         "",
         "Repo: %s" % task["repo"],
         "Branch: %s" % task["branch"],
+        "Working directory: %s" % (cwd or "-"),
         "Steps done: %d" % task.get("steps_done", 0),
         "",
         "## Original request",

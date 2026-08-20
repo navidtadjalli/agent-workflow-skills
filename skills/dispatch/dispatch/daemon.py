@@ -26,7 +26,8 @@ import traceback
 
 from . import chat as chat_mod
 from . import config as config_mod
-from . import governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown
+from . import (governor, lanes, parser, repos, scheduler, sessions, state,
+               usage, volume, winddown, worktrees)
 
 PARSE_PROMPT = (
     "Convert this request into a JSON array of tasks. Each element must have "
@@ -39,6 +40,13 @@ PARSE_ATTEMPTS = 3
 
 # Bytes of crash log kept before one rollover to `daemon.log.1`.
 DAEMON_LOG_MAX = 1_000_000
+
+# Task states after which an isolated worktree can never be stepped into again,
+# so the directory is disposable: every commit is already on `tg/<id>` in the
+# parent repository. Everything else -- including `blocked` and `failed` --
+# keeps its tree, because that is where the uncommitted remains of the last
+# step are and `handoff.md` is written to be read against them.
+RECLAIMABLE = ("done", "cancelled", "parsed")
 
 
 def _clock_text(timestamp):
@@ -291,6 +299,10 @@ class Daemon:
             self._force_poll = True
         if settled:
             modes = self._apply_modes(snapshot, readings, now, tokens)
+
+        # Last, so a task that settled anywhere in this tick has its worktree
+        # released in the same tick rather than a whole interval later.
+        self._reclaim_worktrees()
 
         return {"mode": modes, "readings": readings, "running": sorted(self.running)}
 
@@ -741,17 +753,35 @@ class Daemon:
             doc["hold_reason"] = holds
 
     def _start(self, task, now):
-        cwd = self.repo_path(task["repo"])
-        if cwd is None or not os.path.isdir(cwd):
-            with state.mutate_queue() as queue:
-                record = state.find(queue, task["id"])
-                record["state"] = "blocked"
-                record["last_error"] = "repo is not dispatchable or has gone missing"
+        repo_path = self.repo_path(task["repo"])
+        if repo_path is None or not os.path.isdir(repo_path):
+            self._block(task, "repo is not dispatchable or has gone missing")
             return True
         name = scheduler.lock_name(task)
         handle = state.try_lock(name)
         if handle is None:
             return False
+        cwd = repo_path
+        if task.get("isolation") == "worktree":
+            # Taken before the worktree exists on purpose: `worktree-<id>` is
+            # this task's own lock, so holding it while the tree is built stops
+            # a second step of the same task racing the creation, and it is not
+            # the repo lock, so nothing else in the repository waits on it.
+            made = worktrees.ensure(task, repo_path, config=self.config)
+            if made["path"] is None:
+                state.release(handle)
+                if made["retry"]:
+                    # Another process is mid-creation in this repository. Not
+                    # an error: the task is simply not startable this tick.
+                    return False
+                # Never the parent checkout. An isolated task that cannot get
+                # its own tree is stopped and says why -- running it in the
+                # shared one is the corruption this feature exists to prevent.
+                self._block(task, "no worktree · %s" % made["error"])
+                self.notify("%s [%s] blocked · no worktree · %s" % (
+                    task["id"], lanes.of(task), made["error"]))
+                return True
+            cwd = made["path"]
         with state.mutate_queue() as queue:
             record = state.find(queue, task["id"])
             record["state"] = "running"
@@ -759,9 +789,62 @@ class Daemon:
         future = self.executor.submit(self.run_step, snapshot, cwd)
         self.running[task["id"]] = {
             "future": future, "lock": handle, "lock_name": name,
-            "cwd": cwd, "started_at": now, "task": snapshot,
+            "cwd": cwd, "repo_path": repo_path, "started_at": now,
+            "task": snapshot,
         }
         return True
+
+    def _block(self, task, reason):
+        """Park a task that never started, with something the user can read."""
+        with state.mutate_queue() as queue:
+            record = state.find(queue, task["id"])
+            if record is None:
+                return
+            record["state"] = "blocked"
+            record["last_error"] = reason
+
+    def _reclaim_worktrees(self):
+        """Drop the worktrees of tasks that will never take another step.
+
+        Run once per tick rather than from ``_settle``, so it also covers the
+        cases ``_settle`` never sees: a task cancelled from the CLI while it was
+        paused, and a daemon that died between the step and the settle. Costs
+        one ``os.listdir`` of a directory that is empty on almost every tick.
+
+        ``paused``, ``blocked`` and ``failed`` keep theirs -- the first resumes
+        into it, and the other two are the states someone reads ``handoff.md``
+        about, with whatever the last step left uncommitted still in the tree.
+        """
+        try:
+            names = sorted(os.listdir(worktrees.root(self.config)))
+        except OSError:
+            return
+        if not names:
+            return
+        records = {t["id"]: t for t in state.read_queue()["tasks"]}
+        for name in names:
+            if not worktrees.owned(name) or name in self.running:
+                continue
+            record = records.get(name)
+            if record is not None and record["state"] not in RECLAIMABLE:
+                continue
+            repo = record["repo"] if record else None
+            result = worktrees.discard(
+                name, repo=repo,
+                repo_path=self.repo_path(repo) if repo else None,
+                config=self.config)
+            if not result["ok"]:
+                self._note(name, "worktree not removed: %s" % result["error"])
+
+    def _note(self, task_id, text):
+        """Append a line to a task's worker log. Never worth a crash."""
+        try:
+            directory = config_mod.task_dir(task_id)
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "worker.log"), "a") as fh:
+                fh.write("%s\n" % text)
+        except OSError:
+            pass
 
     def _reap(self, snapshot):
         """Collect finished steps. Returns the set of lanes that settled one.
@@ -863,7 +946,8 @@ class Daemon:
 
         if settled["state"] in ("paused", "blocked", "failed"):
             from . import worker as worker_mod
-            worker_mod.write_handoff(directory, settled, result)
+            worker_mod.write_handoff(directory, settled, result,
+                                     cwd=entry["cwd"])
         if settled["state"] in ("done", "blocked", "failed", "cancelled"):
             self.notify("%s [%s] %s · %s" % (
                 task_id, lane, settled["state"],

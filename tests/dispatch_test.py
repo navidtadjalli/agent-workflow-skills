@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from dispatch import config as config_mod  # noqa: E402
 from dispatch import backends, cli, governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown, worker  # noqa: E402
+from dispatch import worktrees  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -518,6 +519,21 @@ class TestScheduler(unittest.TestCase):
     def test_worktree_isolation_uses_its_own_lock(self):
         self.assertEqual(scheduler.lock_name(self._task()), "repo-demo")
         self.assertEqual(scheduler.lock_name(self._task(isolation="worktree")), "worktree-t-0001")
+
+    def test_two_isolated_tasks_in_one_repo_take_different_locks(self):
+        """Keyed on the task id, so nothing serializes them. Correct only
+        because `daemon._start` now gives each one its own checkout -- before
+        it did, this was the whole bug."""
+        first = scheduler.lock_name(self._task(isolation="worktree"))
+        second = scheduler.lock_name(self._task(id="t-0002", isolation="worktree"))
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first, scheduler.lock_name(self._task()))
+
+    def test_the_creation_lock_cannot_collide_with_a_task_lock(self):
+        """`worktree-add-<repo>` guards one repo's `.git/worktrees`; task ids
+        are always `t-NNNN`, so no repository name reaches that namespace."""
+        self.assertNotEqual(worktrees.add_lock_name("t-0001"),
+                            scheduler.lock_name(self._task(isolation="worktree")))
 
     def test_paused_drains_before_queued(self):
         queue = {"next_id": 4, "tasks": [
@@ -3990,6 +4006,212 @@ class TestStepStatusIsNotInherited(unittest.TestCase):
                                  popen=lambda argv, **kwargs: process,
                                  task_dir=self.tmp.name)
         self.assertEqual(result["status"], "complete")
+
+
+class TestWorktreePlacement(unittest.TestCase):
+    """Where isolated checkouts go, and what can see them there.
+
+    No git here: this is about the location, and the location is what decides
+    whether a worktree can be dispatched to as a repository in its own right.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "dispatch-home")
+        home = mock.patch.dict(os.environ, {"DISPATCH_HOME": self.home})
+        home.start()
+        self.addCleanup(home.stop)
+        self.projects = os.path.join(self.tmp.name, "Projects")
+        os.makedirs(os.path.join(self.projects, "qpay", ".git"))
+
+    def test_the_default_root_is_dispatch_state_not_the_projects_tree(self):
+        root = worktrees.root({})
+        self.assertEqual(os.path.realpath(root),
+                         os.path.realpath(os.path.join(self.home, "worktrees")))
+        self.assertFalse(os.path.realpath(root).startswith(
+            os.path.realpath(self.projects) + os.sep))
+        self.assertEqual(worktrees.path("t-0007", {}),
+                         os.path.join(root, "t-0007"))
+
+    def test_the_root_is_one_config_value_away(self):
+        """The only reason to move it: codex resume steps carry no sandbox
+        flag and fall back to the path-keyed trust levels in
+        `~/.codex/config.toml`. That is a machine fact, not a code change."""
+        elsewhere = os.path.join(self.tmp.name, "trusted")
+        self.assertEqual(worktrees.root({"worktree_root": elsewhere}), elsewhere)
+
+    def test_a_worktree_at_the_default_root_is_not_discoverable_as_a_repo(self):
+        """`repos._entry` accepts a `.git` *file*, which is exactly what a
+        linked worktree has. Parked among the checkouts, one would be listed
+        and dispatchable -- another lane could then be pointed straight into an
+        isolated task's private tree, under a different lock."""
+        tree = worktrees.path("t-0001", {})
+        os.makedirs(tree)
+        with open(os.path.join(tree, ".git"), "w") as fh:
+            fh.write("gitdir: %s/qpay/.git/worktrees/t-0001\n" % self.projects)
+
+        found = repos.discover(root=self.projects)
+        self.assertEqual(sorted(found), ["qpay"])
+        self.assertIsNone(repos.resolve("t-0001", root=self.projects))
+        # And the hazard is real: dropped into the projects root it *would* be.
+        planted = os.path.join(self.projects, "t-0001")
+        shutil.copytree(tree, planted)
+        self.assertTrue(repos.discover(root=self.projects)["t-0001"]["git"])
+
+
+class TestWorktreeGitFailures(unittest.TestCase):
+    """git is a subprocess, and every way it can go wrong has to come back as
+    a reason on the task rather than as an exception out of the tick."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = mock.patch.dict(
+            os.environ, {"DISPATCH_HOME": os.path.join(self.tmp.name, "home")})
+        home.start()
+        self.addCleanup(home.stop)
+        self.task = {"id": "t-0001", "repo": "qpay", "branch": "tg/t-0001"}
+        self.repo = os.path.join(self.tmp.name, "qpay")
+        os.makedirs(self.repo)
+
+    def test_no_git_on_path_is_a_reason_not_a_traceback(self):
+        def missing(args, cwd=None, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory: 'git'")
+
+        made = worktrees.ensure(self.task, self.repo, config={}, runner=missing)
+        self.assertIsNone(made["path"])
+        self.assertIn("git", made["error"])
+
+    def test_a_failed_add_reports_gits_own_words(self):
+        def runner(args, cwd=None, **kwargs):
+            failed = args[1] == "worktree" and args[2] == "add"
+            return subprocess.CompletedProcess(
+                args, 1 if failed else 1,
+                stdout="Preparing worktree (new branch)\n" if failed else "",
+                stderr="fatal: invalid reference: HEAD\n" if failed else "")
+
+        made = worktrees.ensure(self.task, self.repo, config={}, runner=runner)
+        self.assertIsNone(made["path"])
+        self.assertEqual(made["error"], "fatal: invalid reference: HEAD")
+        self.assertFalse(made["retry"])
+
+    def test_a_busy_creation_lock_defers_instead_of_failing(self):
+        held = state.try_lock(worktrees.add_lock_name("qpay"))
+        self.addCleanup(state.release, held)
+        calls = []
+        made = worktrees.ensure(self.task, self.repo, config={},
+                                runner=lambda *a, **k: calls.append(a))
+        self.assertTrue(made["retry"])
+        self.assertIsNone(made["error"])
+        self.assertEqual(calls, [], "no git may run while the lock is held")
+
+
+class TestIsolationNeverFallsBack(unittest.TestCase):
+    """An isolated task that cannot get a worktree must not run anywhere.
+
+    The one behaviour that may never be implemented is using the parent
+    checkout instead: `scheduler.lock_name` has already told admission that
+    this task does not contend for the repo, so the shared tree is exactly
+    where it must not go.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = mock.patch.dict(
+            os.environ,
+            {"DISPATCH_HOME": os.path.join(self.tmp.name, "home"),
+             "DISPATCH_TOKEN_ENV": os.path.join(self.tmp.name, "absent.env")})
+        home.start()
+        self.addCleanup(home.stop)
+        self.projects = os.path.join(self.tmp.name, "Projects")
+        os.makedirs(os.path.join(self.projects, "qpay", ".git"))
+        self.logs = os.path.join(self.tmp.name, "empty-logs")
+        os.makedirs(self.logs)
+        self.now = 1_800_000_000.0
+        self.started = []
+
+    def _daemon(self):
+        from dispatch import chat as chat_mod
+        from dispatch import daemon as daemon_mod
+        daemon = daemon_mod.Daemon(
+            checkpoint=lambda task, cwd, message: {"ok": True, "committed": True},
+            config={"projects_root": self.projects, "chat_allowlist": ["1"]},
+            clock=lambda: self.now,
+            poll_usage=lambda: {"ok": True, "at": self.now, "session_pct": 10.0,
+                                "session_reset": self.now + 3600, "week_pct": 5.0,
+                                "week_reset": self.now + 86400},
+            count_tokens=lambda: 0,
+            codex_estimate=lambda now: {"session_pct": 10.0, "week_pct": 0.0,
+                                        "source": "codex-logs", "stale": False,
+                                        "resets_at": None},
+            chat=chat_mod.NullChat(),
+            run_step=lambda task, cwd: self.started.append((task["id"], cwd)) or {
+                "status": "complete", "summary": "ok", "next": "", "output": "",
+                "limit_reset_at": None, "session_id": None, "timed_out": False},
+            executor=daemon_mod.InlineExecutor())
+        daemon.volume_block = lambda now: volume.render(
+            now, claude_root=self.logs, codex_root=self.logs)
+        self.addCleanup(self._release, daemon)
+        return daemon
+
+    @staticmethod
+    def _release(daemon):
+        for entry in daemon.running.values():
+            state.release(entry["lock"])
+        daemon.running.clear()
+
+    def _queue(self):
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "isolated", isolation="worktree")
+
+    def test_a_creation_failure_blocks_the_task_and_says_why(self):
+        self._queue()
+        daemon = self._daemon()
+        with mock.patch.object(worktrees, "ensure", return_value={
+                "path": None, "error": "fatal: invalid reference: HEAD",
+                "retry": False}):
+            daemon.tick()
+
+        self.assertEqual(self.started, [])
+        task = state.find(state.read_queue(), "t-0001")
+        self.assertEqual(task["state"], "blocked")
+        self.assertIn("no worktree", task["last_error"])
+        self.assertIn("invalid reference", task["last_error"])
+        self.assertTrue(any("no worktree" in n for n in daemon.notices),
+                        daemon.notices)
+
+    def test_metadata_held_elsewhere_defers_rather_than_blocking(self):
+        """Another process mid-`worktree add` in this repository is not an
+        error. The task stays queued, exactly as a busy repo lock leaves it."""
+        self._queue()
+        daemon = self._daemon()
+        with mock.patch.object(worktrees, "ensure", return_value={
+                "path": None, "error": None, "retry": True}):
+            daemon.tick()
+
+        self.assertEqual(self.started, [])
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "queued")
+
+    def test_the_step_runs_in_the_worktree_not_the_repo(self):
+        self._queue()
+        tree = os.path.join(self.tmp.name, "somewhere-else")
+        daemon = self._daemon()
+        with mock.patch.object(worktrees, "ensure", return_value={
+                "path": tree, "error": None, "retry": False}):
+            daemon.tick()
+
+        self.assertEqual(self.started, [("t-0001", tree)])
+
+    def test_a_repo_lane_task_is_untouched_by_any_of_this(self):
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "shared")
+        with mock.patch.object(worktrees, "ensure",
+                               side_effect=AssertionError("not for repo tasks")):
+            self._daemon().tick()
+        self.assertEqual(self.started,
+                         [("t-0001", os.path.join(self.projects, "qpay"))])
 
 
 if __name__ == "__main__":

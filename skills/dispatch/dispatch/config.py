@@ -35,6 +35,13 @@ DEFAULTS = {
     # aliases pointing somewhere else entirely.
     "projects_root": "~/Projects",
     "repos": {},
+    # Where `isolation=worktree` tasks get their own checkout. Empty means
+    # `<DISPATCH_HOME>/worktrees`, which is deliberately outside
+    # `projects_root` so a worktree can never be discovered as a repo. Worth
+    # overriding for one reason only: codex resume steps carry no sandbox flag
+    # and fall back to the trust levels in `~/.codex/config.toml`, which are
+    # keyed on the path. See `docs/operations.md`.
+    "worktree_root": None,
 }
 
 

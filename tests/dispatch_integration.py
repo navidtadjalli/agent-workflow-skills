@@ -12,6 +12,7 @@ points and announces its thread id on the event stream.
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,9 @@ from dispatch import chat as chat_mod  # noqa: E402
 from dispatch import config as config_mod  # noqa: E402
 from dispatch import daemon as daemon_mod  # noqa: E402
 from dispatch import lanes  # noqa: E402
+from dispatch import repos  # noqa: E402
 from dispatch import state  # noqa: E402
+from dispatch import worktrees  # noqa: E402
 
 # The one chat the fixture daemon serves. Nothing reaches Telegram -- the
 # transport is a NullChat -- but the allowlist has to name somebody, because
@@ -39,7 +42,9 @@ prompt = sys.stdin.read()
 if mode == "limit":
     print("Claude AI usage limit reached|%s" % os.environ["STUB_RESET"])
     sys.exit(1)
-open(os.path.join(os.environ["STUB_REPO"], "worked.txt"), "a").write("step\\n")
+# Into its own working directory, which is the only evidence of where the
+# daemon actually launched this step.
+open("worked.txt", "a").write("step\\n")
 body = "prompt-was: %s\\n```json\\n%s\\n```" % (prompt.strip(), json.dumps(
     {"status": mode, "summary": "stub step", "next": "more"}))
 print(json.dumps({"session_id": "sess-stub", "result": body}))
@@ -58,7 +63,7 @@ if mode == "die":
     # Killed at the step timeout, or crashed: no status file is written.
     sys.stderr.write("codex stub died\\n")
     sys.exit(3)
-open(os.path.join(os.environ["STUB_REPO"], "worked.txt"), "a").write("codex\\n")
+open("worked.txt", "a").write("codex\\n")
 with open(out, "w") as fh:
     json.dump({"status": mode, "summary": "codex stub", "next": ""}, fh)
 print(json.dumps({"type": "thread.started", "thread_id": "codex-stub"}))
@@ -93,7 +98,6 @@ class DispatchIntegration(unittest.TestCase):
         os.environ.update({
             "DISPATCH_HOME": self.home,
             "PATH": bin_dir + os.pathsep + os.environ["PATH"],
-            "STUB_REPO": self.repo,
             "STUB_MODE": "complete",
             "STUB_ARGV": self.codex_argv,
             "GIT_AUTHOR_NAME": "dispatch test",
@@ -160,9 +164,11 @@ class DispatchIntegration(unittest.TestCase):
             executor=daemon_mod.InlineExecutor(),
             **over)
 
-    def _enqueue(self, prompt="do the thing", agent="claude", repo="demo"):
+    def _enqueue(self, prompt="do the thing", agent="claude", repo="demo",
+                 isolation="repo"):
         with state.mutate_queue() as queue:
-            return state.new_task(queue, repo, prompt, agent=agent)
+            return state.new_task(queue, repo, prompt, agent=agent,
+                                  isolation=isolation)
 
     def _modes(self, claude="running", codex="running"):
         return {lanes.CLAUDE: claude, lanes.CODEX: codex}
@@ -224,6 +230,265 @@ class DispatchIntegration(unittest.TestCase):
         daemon.tick()
         # Both are admissible on usage; only one may hold the repo lock.
         self.assertEqual(started, ["t-0001"])
+
+    def _watch(self, daemon):
+        """Record the working directory every step is actually launched in."""
+        seen = {}
+        original = daemon.run_step
+
+        def watched(task, cwd):
+            seen[task["id"]] = cwd
+            return original(task, cwd)
+
+        daemon.run_step = watched
+        return seen
+
+    def test_two_worktree_tasks_never_share_a_checkout(self):
+        """The regression this whole feature exists for.
+
+        `scheduler.lock_name` gives each `isolation="worktree"` task its own
+        lock, so both are admitted in the same tick. Before real worktrees
+        existed they were both launched in the parent checkout: two unattended
+        agents doing `git checkout -B` and `git add -A && git commit` in one
+        working tree.
+        """
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("first", isolation="worktree")
+        self._enqueue("second", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        self.assertEqual(sorted(seen), ["t-0001", "t-0002"])
+        first, second = seen["t-0001"], seen["t-0002"]
+        self.assertNotEqual(os.path.realpath(first), os.path.realpath(second))
+        for cwd in (first, second):
+            self.assertNotEqual(os.path.realpath(cwd),
+                                os.path.realpath(self.repo))
+
+    def test_an_isolated_task_runs_beside_repo_lane_work_in_one_repo(self):
+        """What the isolation is *for*: not serializing behind the shared lock.
+
+        The repo-lane task holds `repo-demo` for the length of its step; the
+        isolated one takes `worktree-t-0002` and starts in the same tick. That
+        is only sound because the two are now genuinely different directories.
+        """
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("shared")
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        self.assertEqual(sorted(seen), ["t-0001", "t-0002"])
+        self.assertEqual(os.path.realpath(seen["t-0001"]),
+                         os.path.realpath(self.repo))
+        self.assertNotEqual(os.path.realpath(seen["t-0002"]),
+                            os.path.realpath(self.repo))
+
+    def test_an_isolated_step_commits_to_its_branch_and_leaves_the_parent_alone(self):
+        """`checkpoint` runs `checkout -B` only when HEAD is not already the
+        task branch. A worktree is created *on* that branch, so the checkout is
+        skipped -- which matters twice over: git refuses to check out a branch
+        that is live in another worktree, and the parent's own HEAD must not be
+        dragged onto `tg/<id>` the way the shared-checkout path does it."""
+        before = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self._enqueue("isolated", isolation="worktree")
+        self._daemon().tick()
+
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "done")
+        self.assertEqual(
+            self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), before)
+        self.assertEqual(self._git("status", "--porcelain").stdout.strip(), "")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "worked.txt")))
+        # The work is on the branch, in the parent repository, where every
+        # other surface already looks for it.
+        self.assertIn("t-0001 step 1",
+                      self._git("log", "--oneline", "tg/t-0001").stdout)
+        self.assertIn("step", self._git("show", "tg/t-0001:worked.txt").stdout)
+
+    def test_a_codex_step_is_pointed_at_the_worktree_too(self):
+        """`-C` is chosen inside `build_command` from the cwd the daemon hands
+        the worker, so it is worth proving on the real launch that the codex
+        lane is confined to the isolated tree and not the shared one."""
+        self._enqueue("isolated", agent="codex", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        argv = self._codex_argv()[0]
+        self.assertEqual(argv[argv.index("-C") + 1], seen["t-0001"])
+        self.assertNotEqual(os.path.realpath(seen["t-0001"]),
+                            os.path.realpath(self.repo))
+        self.assertIn("t-0001 step 1",
+                      self._git("log", "--oneline", "tg/t-0001").stdout)
+
+    def test_the_worktree_lives_where_no_repo_discovery_can_reach_it(self):
+        """A linked worktree's `.git` is a *file*, and `repos.discover` accepts
+        that as evidence of a dispatchable repository. Parked among the
+        checkouts it would become one -- reachable from chat, under its own
+        `repo-<name>` lock, inside another task's private tree."""
+        os.environ["STUB_MODE"] = "continue"  # so the tree outlives the tick
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        tree = seen["t-0001"]
+        self.assertTrue(os.path.isfile(os.path.join(tree, ".git")),
+                        "expected a linked worktree, not a clone")
+        root = os.path.realpath(os.path.join(self.tmp.name, "empty-root"))
+        self.assertFalse(os.path.realpath(tree).startswith(root + os.sep))
+        found = repos.discover(root=root, overrides={"demo": self.repo,
+                                                     "other": self.repo2})
+        self.assertEqual(sorted(found), ["demo", "other"])
+
+    def test_a_second_step_resumes_into_the_same_worktree(self):
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        seen = []
+        original = daemon.run_step
+
+        def watched(task, cwd):
+            seen.append(cwd)
+            return original(task, cwd)
+
+        daemon.run_step = watched
+        daemon.tick()
+        self.now += 120
+        daemon.tick()
+
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(os.path.realpath(seen[0]), os.path.realpath(seen[1]))
+        self.assertNotEqual(os.path.realpath(seen[0]), os.path.realpath(self.repo))
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["steps_done"], 2)
+
+    def test_a_paused_task_keeps_the_worktree_it_will_resume_into(self):
+        os.environ["STUB_MODE"] = "limit"
+        os.environ["STUB_RESET"] = str(int(self.now + 3600))
+        self._enqueue("isolated", isolation="worktree")
+        self._daemon().tick()
+
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "paused")
+        self.assertTrue(os.path.isdir(worktrees.path("t-0001")))
+        # And the handoff says where it is, which is the only record of it.
+        with open(os.path.join(config_mod.task_dir("t-0001"), "handoff.md")) as fh:
+            self.assertIn(worktrees.path("t-0001"), fh.read())
+
+    def test_a_blocked_task_keeps_its_worktree_to_be_looked_at(self):
+        os.environ["STUB_MODE"] = "blocked"
+        self._enqueue("isolated", isolation="worktree")
+        self._daemon().tick()
+
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "blocked")
+        self.assertTrue(os.path.isdir(worktrees.path("t-0001")))
+
+    def test_a_finished_task_gives_its_worktree_back(self):
+        self._enqueue("isolated", isolation="worktree")
+        self._daemon().tick()
+
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "done")
+        self.assertFalse(os.path.exists(worktrees.path("t-0001")))
+        # Registration gone too, not merely the directory.
+        self.assertNotIn("t-0001", self._git("worktree", "list").stdout)
+        # The commits are the deliverable and they stay.
+        self.assertIn("t-0001 step 1",
+                      self._git("log", "--oneline", "tg/t-0001").stdout)
+
+    def test_cancelling_a_paused_task_releases_its_worktree(self):
+        """The sweep runs off the queue, not off `_settle`, so it also covers
+        a task cancelled from the CLI while it was parked."""
+        os.environ["STUB_MODE"] = "limit"
+        os.environ["STUB_RESET"] = str(int(self.now + 3600))
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        daemon.tick()
+        self.assertTrue(os.path.isdir(worktrees.path("t-0001")))
+
+        with state.mutate_queue() as queue:
+            state.find(queue, "t-0001")["state"] = "cancelled"
+        self.now += 120
+        daemon.tick()
+        self.assertFalse(os.path.exists(worktrees.path("t-0001")))
+
+    def test_the_sweep_only_removes_what_it_created(self):
+        """It runs `rmtree`. Anything in the worktree root that is not a task
+        id was put there by a person, and stays there."""
+        os.makedirs(worktrees.root(), exist_ok=True)
+        keep = os.path.join(worktrees.root(), "notes")
+        os.makedirs(keep)
+        with open(os.path.join(keep, "mine.txt"), "w") as fh:
+            fh.write("mine\n")
+        self._enqueue("isolated", isolation="worktree")
+        self._daemon().tick()
+
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "done")
+        self.assertFalse(os.path.exists(worktrees.path("t-0001")))
+        self.assertTrue(os.path.exists(os.path.join(keep, "mine.txt")))
+
+    def test_a_stale_registration_does_not_wedge_the_next_step(self):
+        """The directory can vanish under a live registration -- a wiped home,
+        a crash between `add` and the step. Without a prune, `add` then refuses
+        the very path it is being asked to rebuild."""
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        daemon.tick()
+        tree = worktrees.path("t-0001")
+        shutil.rmtree(tree)
+
+        self.now += 120
+        seen = self._watch(daemon)
+        daemon.tick()
+        self.assertEqual(os.path.realpath(seen["t-0001"]), os.path.realpath(tree))
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["steps_done"], 2)
+
+    def test_a_repo_with_no_commits_blocks_instead_of_running_in_the_parent(self):
+        fresh = os.path.join(self.tmp.name, "fresh-repo")
+        os.makedirs(fresh)
+        self._git("init", "-q", cwd=fresh)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "fresh", "isolated", isolation="worktree")
+        daemon = self._daemon(config_extra={
+            "repos": {"demo": self.repo, "other": self.repo2, "fresh": fresh}})
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        self.assertEqual(seen, {})
+        settled = state.find(state.read_queue(), "t-0001")
+        self.assertEqual(settled["state"], "blocked")
+        self.assertIn("no worktree", settled["last_error"])
+        self.assertTrue(any("no worktree" in n for n in daemon.notices),
+                        daemon.notices)
+        self.assertFalse(os.path.exists(os.path.join(fresh, "worked.txt")))
+
+    def test_a_branch_already_checked_out_blocks_instead_of_falling_back(self):
+        self._git("checkout", "-q", "-b", "tg/t-0001")
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        self.assertEqual(seen, {})
+        settled = state.find(state.read_queue(), "t-0001")
+        self.assertEqual(settled["state"], "blocked")
+        self.assertIn("no worktree", settled["last_error"])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "worked.txt")))
+
+    def test_a_foreign_directory_in_the_way_is_refused_not_clobbered(self):
+        tree = worktrees.path("t-0001")
+        os.makedirs(tree)
+        with open(os.path.join(tree, "someones-notes.txt"), "w") as fh:
+            fh.write("not ours\n")
+        self._enqueue("isolated", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+
+        self.assertEqual(seen, {})
+        self.assertEqual(state.find(state.read_queue(), "t-0001")["state"], "blocked")
+        self.assertTrue(os.path.exists(os.path.join(tree, "someones-notes.txt")))
 
     def test_soft_limit_stops_new_dispatch(self):
         task = self._enqueue()
