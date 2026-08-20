@@ -101,7 +101,11 @@ def codex_usage(now, root=None):
     The record's own ``total_tokens`` is read directly rather than recomputed
     from ``input_tokens`` + ``output_tokens``: it is the field the session log
     already labels as the total, and trusting it is what lets a session whose
-    record only carries a subset of sub-fields still report correctly.
+    record carries extra sub-fields (cached, reasoning) still report the real
+    total rather than an undercount stitched from the wrong parts. A record
+    that omits ``total_tokens`` falls back to summing the parts it does have --
+    codex's log schema is not ours to rely on staying put, and reporting a
+    silent zero would read as "you have headroom" when you do not.
     """
     root = root or os.path.join(HOME, ".codex", "sessions")
     tot = Counter()
@@ -133,7 +137,11 @@ def codex_usage(now, root=None):
         except Exception:
             continue
         if last:
-            n = last.get("total_tokens", 0) or 0
+            n = last.get("total_tokens")
+            if n is None:
+                # Older or partial records omit the total; the parts still add
+                # up to it, so fall back rather than silently counting zero.
+                n = (last.get("input_tokens", 0) or 0) + (last.get("output_tokens", 0) or 0)
             tot["all"] += n
             tot["out"] += last.get("output_tokens", 0) or 0
             if age < 5 * HOUR:

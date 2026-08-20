@@ -1101,6 +1101,21 @@ class TestVolume(unittest.TestCase):
             self.now, root=os.path.join(self.tmp.name, "codex"))
         self.assertEqual(totals["all"], 900)
 
+    def test_codex_falls_back_to_parts_when_total_is_absent(self):
+        """Older records carry only the sub-fields; they must not count zero."""
+        directory = os.path.join(self.tmp.name, "codex", "2026", "08", "19")
+        os.makedirs(directory)
+        path = os.path.join(directory, "r.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"payload": {"cwd": "/home/navid/Projects/qpay"}}) + "\n")
+            fh.write(json.dumps({"payload": {"info": {"total_token_usage": {
+                "input_tokens": 700, "output_tokens": 200}}}}) + "\n")
+        os.utime(path, (self.now, self.now))
+        totals, _ = volume.codex_usage(
+            self.now, root=os.path.join(self.tmp.name, "codex"))
+        self.assertEqual(totals["all"], 900)
+        self.assertEqual(totals["out"], 200)
+
     def test_human_scales(self):
         self.assertEqual(volume.human(1_500_000), "1.5M")
         self.assertEqual(volume.human(2_000), "2.0K")
@@ -1109,8 +1124,12 @@ class TestVolume(unittest.TestCase):
     def test_render_never_spends_a_request(self):
         """`usage` must be free; only `usage poll` may spend a request.
 
-        Asserted behaviourally: the paid path is a subprocess, so make any
-        subprocess fatal and prove render() completes without one.
+        The subprocess mock only catches an *unswallowed* call: the original
+        `plan_limits()` wrapped its `subprocess.run` in `except Exception`, so
+        a reintroduced copy with that same swallowing pattern would eat the
+        injected error here and still return normally. The real backstop is
+        the `hasattr` assertion below -- it fails the moment `plan_limits`
+        exists again, regardless of how carefully it hides its own call.
         """
         empty = os.path.join(self.tmp.name, "none")
         boom = AssertionError("render() spawned a subprocess")
