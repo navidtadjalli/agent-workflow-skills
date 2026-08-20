@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import backends, governor, lanes, parser, repos, scheduler, state, usage, volume, winddown, worker  # noqa: E402
+from dispatch import backends, governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -1145,6 +1145,80 @@ class TestVolume(unittest.TestCase):
                              claude_root=os.path.join(self.tmp.name, "none"),
                              codex_root=os.path.join(self.tmp.name, "none"))
         self.assertIn("CLAUDE", text)
+
+
+class TestSessions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 1_800_000_000.0
+        self.root = os.path.join(self.tmp.name, "projects")
+
+    def _session(self, project, sid, records, age=60):
+        directory = os.path.join(self.root, project)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, sid + ".jsonl")
+        with open(path, "w") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+        os.utime(path, (self.now - age, self.now - age))
+        return path
+
+    def test_scan_reads_title_cwd_and_turn_counts(self):
+        path = self._session("-home-navid-Projects-qpay", "abc", [
+            {"type": "ai-title", "aiTitle": "Fix the auth test"},
+            {"type": "user", "cwd": "/home/navid/Projects/qpay-backend"},
+            {"type": "assistant"},
+            {"type": "last-prompt", "lastPrompt": "now run the tests"}])
+        summary = sessions.scan(path, self.now)
+        self.assertEqual(summary["title"], "Fix the auth test")
+        self.assertEqual(summary["n_user"], 1)
+        self.assertEqual(summary["n_asst"], 1)
+        self.assertEqual(summary["last_prompt"], "now run the tests")
+
+    def test_empty_stub_sessions_are_skipped(self):
+        path = self._session("-home-navid-Projects-qpay", "empty", [
+            {"type": "mode", "mode": "default"}])
+        self.assertIsNone(sessions.scan(path, self.now))
+
+    def test_collect_is_newest_first(self):
+        self._session("-home-navid-Projects-qpay", "old", [
+            {"type": "user"}, {"type": "ai-title", "aiTitle": "older"}], age=9000)
+        self._session("-home-navid-Projects-qpay", "new", [
+            {"type": "user"}, {"type": "ai-title", "aiTitle": "newer"}], age=60)
+        titles = [s["title"] for s in sessions.collect(self.now, root=self.root)]
+        self.assertEqual(titles[0], "newer")
+
+    def test_collect_filters_by_project(self):
+        self._session("-home-navid-Projects-qpay", "a", [
+            {"type": "user", "cwd": "/home/navid/Projects/qpay-backend"}])
+        self._session("-home-navid-Projects-poook", "b", [
+            {"type": "user", "cwd": "/home/navid/Projects/poook"}])
+        rows = sessions.collect(self.now, root=self.root, project="qpay")
+        self.assertEqual(len(rows), 1)
+
+    def test_collect_respects_the_limit(self):
+        for index in range(5):
+            self._session("-home-navid-Projects-qpay", "s%d" % index,
+                          [{"type": "user"}], age=60 + index)
+        self.assertEqual(len(sessions.collect(self.now, root=self.root, limit=3)), 3)
+
+    def test_render_on_an_empty_tree(self):
+        self.assertIn("no sessions", sessions.render(
+            self.now, root=os.path.join(self.tmp.name, "gone")).lower())
+
+    def test_render_is_plain_text(self):
+        """Chat replies set no parse mode, so markdown tables would be noise."""
+        self._session("-home-navid-Projects-qpay", "a", [
+            {"type": "user"}, {"type": "ai-title", "aiTitle": "Fix auth"}])
+        text = sessions.render(self.now, root=self.root)
+        self.assertIn("Fix auth", text)
+        self.assertNotIn("|---", text)
+
+    def test_launch_is_not_exposed(self):
+        """A launch from chat produces a terminal nobody is typing into."""
+        self.assertFalse(hasattr(sessions, "cmd_launch"))
+        self.assertFalse(hasattr(sessions, "launch"))
 
 
 if __name__ == "__main__":

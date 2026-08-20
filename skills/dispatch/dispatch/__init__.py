@@ -11,6 +11,7 @@ __all__ = [
     "state",
     "lanes",
     "repos",
+    "sessions",
     "usage",
     "volume",
     "governor",
