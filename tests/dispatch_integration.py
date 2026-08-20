@@ -27,6 +27,11 @@ from dispatch import daemon as daemon_mod  # noqa: E402
 from dispatch import lanes  # noqa: E402
 from dispatch import state  # noqa: E402
 
+# The one chat the fixture daemon serves. Nothing reaches Telegram -- the
+# transport is a NullChat -- but the allowlist has to name somebody, because
+# an empty one is now a refusal to serve chat at all.
+CHAT_ID = "4242"
+
 STUB = """#!/usr/bin/env python3
 import json, os, sys
 mode = os.environ.get("STUB_MODE", "complete")
@@ -102,10 +107,13 @@ class DispatchIntegration(unittest.TestCase):
         # On disk as well as injected: a CLI subprocess gets no in-memory
         # config, and without this `dispatch add` would discover the
         # developer's real ~/Projects.
+        # A chat id, because an empty allowlist now means nobody: the daemon
+        # refuses to build a transport for it, and a fixture that ships one
+        # would be testing a configuration no deployment may run in.
         state.write(config_mod.config_path(), {
             "projects_root": os.path.join(root, "empty-root"),
             "repos": {"demo": self.repo, "other": self.repo2},
-            "chat_allowlist": []})
+            "chat_allowlist": [CHAT_ID]})
 
         for repo in (self.repo, self.repo2):
             self._git("init", "-q", cwd=repo)
@@ -136,7 +144,7 @@ class DispatchIntegration(unittest.TestCase):
             # An empty projects root, so discovery never sees the real ~/Projects.
             config={"projects_root": os.path.join(self.tmp.name, "empty-root"),
                     "repos": {"demo": self.repo, "other": self.repo2},
-                    "chat_allowlist": []},
+                    "chat_allowlist": [CHAT_ID]},
             clock=lambda: self.now,
             poll_usage=lambda: reading,
             count_tokens=lambda: 0,
@@ -474,6 +482,10 @@ class DispatchIntegration(unittest.TestCase):
                              stdin=subprocess.DEVNULL)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(os.path.isdir(os.path.join(home, "locks")), out.stdout)
+        # This home has no config.json, so the allowlist is empty. The daemon
+        # still starts -- refusing would be a crash loop under the watchdog --
+        # and says why it will answer nobody.
+        self.assertIn("allowlist", out.stderr)
 
     def test_the_launch_command_pins_path_through_the_shell(self):
         """The daemon's children exec a bare `claude` and a bare `codex`.

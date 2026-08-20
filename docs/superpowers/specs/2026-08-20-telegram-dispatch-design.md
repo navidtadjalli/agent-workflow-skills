@@ -366,6 +366,22 @@ by an unattended agent running without permission prompts, from any message that
 passes the chat allowlist. The allowlist is a single chat id and is the only
 thing standing in front of that.
 
+Because it is the only thing, it fails closed. An empty allowlist means nobody,
+not everybody: `Chat.allowed` denies it, `Chat` refuses to be constructed
+without one at all, and the daemon answers an empty allowlist by running with no
+chat transport and a standing reason -- printed at startup and shown by
+`dispatch status` -- rather than by serving one. That matters because the
+allowlist can vanish on its own: `config.load()` falls back to `DEFAULTS`, whose
+allowlist is empty, whenever `config.json` is missing or does not parse. A
+truncated write used to turn authentication off while the bot went on answering
+normally. Now a config that cannot be read says so on stderr, and the fallback
+it lands on admits nobody.
+
+The daemon still starts in that state, deliberately. It keeps draining the queue
+for `dispatch add`, and `dispatch status` can say why chat is refused; a daemon
+that refused to start would be relaunched by the cron watchdog every five
+minutes, with the reason going down with each pane.
+
 **A dead daemon is a lockout.** The cron watchdog covers crash and reboot. It
 does not cover a bug that makes the daemon start and then fail to poll, or a
 revoked token. Recovery from those requires physical access.

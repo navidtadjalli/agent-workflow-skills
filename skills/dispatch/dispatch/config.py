@@ -4,6 +4,7 @@ Everything is rooted at ``DISPATCH_HOME`` (default ``~/.claude/dispatch``) so
 tests can point the whole system at a temporary directory.
 """
 import os
+import sys
 
 DEFAULTS = {
     # Governor thresholds, in percent of the plan window.
@@ -20,7 +21,8 @@ DEFAULTS = {
     # Cost model: percent of the session window a single step is assumed to
     # burn before a repo has any measured history.
     "default_est_cost_pct": 6.0,
-    # Chat.
+    # Chat. Empty means nobody: the daemon refuses to serve chat until an id
+    # is listed here, rather than admitting every chat that finds the bot.
     "chat_allowlist": [],
     # Repos are discovered under this root; `repos` holds overrides only --
     # aliases pointing somewhere else entirely.
@@ -107,18 +109,48 @@ def ensure_dirs():
         os.makedirs(path(sub) if sub else home(), exist_ok=True)
 
 
+def _unreadable(detail):
+    """Say, out loud, that the file holding the trust boundary did not parse.
+
+    Swallowing this is how the allowlist could vanish without anyone knowing:
+    a truncated write or a bad hand-edit fell back to ``DEFAULTS``, and the bot
+    went on answering. The fallback stays -- raising would take the daemon and
+    the CLI down together, leaving no way to fix the file that broke them --
+    but the defaults it falls back to now admit nobody, and this line names the
+    file so the condition is repairable rather than merely survivable.
+    """
+    print("warning: %s is unreadable (%s); falling back to defaults, whose "
+          "chat allowlist is empty -- chat intake stays refused until the file "
+          "is fixed" % (config_path(), detail), file=sys.stderr)
+
+
 def load(overrides=None):
-    """Merge defaults with config.json and an optional in-memory override."""
+    """Merge defaults with config.json and an optional in-memory override.
+
+    A missing file is normal -- first run, and every test home -- and stays
+    silent. Anything else that stops the file being read is reported.
+    """
     import json
 
     cfg = dict(DEFAULTS)
+    loaded = None
     try:
         with open(config_path()) as fh:
-            cfg.update(json.load(fh) or {})
+            loaded = json.load(fh)
     except FileNotFoundError:
-        pass
-    except (OSError, ValueError):
-        pass
+        loaded = None
+    except (OSError, ValueError) as exc:
+        _unreadable("%s: %s" % (type(exc).__name__, exc))
+        loaded = None
+    else:
+        if loaded is not None and not isinstance(loaded, dict):
+            # Valid JSON, wrong shape. `cfg.update` on a list raises, and on a
+            # string of two-character items silently invents keys.
+            _unreadable("top level is %s, not an object"
+                        % type(loaded).__name__)
+            loaded = None
+    if loaded:
+        cfg.update(loaded)
     if overrides:
         cfg.update(overrides)
     return cfg

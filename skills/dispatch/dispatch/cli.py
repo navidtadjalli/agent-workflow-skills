@@ -278,6 +278,56 @@ def _daemon_argv():
     return command, package
 
 
+def _keep_unreadable_config():
+    """Copy a config.json that does not parse aside before setup rewrites it.
+
+    ``setup`` merges its arguments onto ``config.load()``, and a file that
+    cannot be read loads as the defaults -- so the write that follows would
+    discard whatever repo overrides and chat ids the broken file still holds.
+    They are the two things hardest to reconstruct from memory, so the bytes
+    are kept rather than the operator's recollection of them.
+    """
+    path = config_mod.config_path()
+    try:
+        with open(path) as fh:
+            body = fh.read()
+        json.loads(body)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        pass
+    else:
+        return None
+    kept = path + ".corrupt"
+    try:
+        with open(kept, "w") as fh:
+            fh.write(body)
+    except OSError as exc:
+        print("warning: could not keep the unreadable %s (%s)" % (path, exc),
+              file=sys.stderr)
+        return None
+    print("warning: %s did not parse; kept it as %s before overwriting"
+          % (path, kept), file=sys.stderr)
+    return kept
+
+
+def _warn_empty_allowlist(cfg=None):
+    """Say, on stderr, that this configuration answers nobody.
+
+    An empty allowlist is refused rather than served -- see
+    ``daemon._default_chat`` -- and after the cutover a bot that answers nobody
+    is indistinguishable from a healthy daemon with nothing to do. Both places
+    that hand the user a running system say so; neither refuses, because the
+    queue and `dispatch add` still work without chat.
+    """
+    cfg = config_mod.load() if cfg is None else cfg
+    if cfg.get("chat_allowlist"):
+        return False
+    print("warning: chat_allowlist is empty; the daemon will refuse every "
+          "chat. Fix it with: dispatch setup --chat <chat-id>", file=sys.stderr)
+    return True
+
+
 def cmd_up(args):
     """Start the daemon in tmux. Idempotent; --if-dead makes it silent."""
     runner = getattr(args, "runner", None)
@@ -316,6 +366,7 @@ def cmd_up(args):
         # cutover means no interface at all.
         print("warning: no bot token at %s; the daemon will run with no chat "
               "transport" % config_mod.token_env_path(), file=sys.stderr)
+    _warn_empty_allowlist()
     return 0
 
 
@@ -500,6 +551,7 @@ def cmd_setup(args):
                       "starting the daemon" % (PLUGIN_KEY, settings_path),
                       file=sys.stderr)
 
+    _keep_unreadable_config()
     cfg = config_mod.load()
     if args.repo:
         # `overrides`, not `repos`: that name is the discovery module here now.
@@ -519,6 +571,8 @@ def cmd_setup(args):
     if config_mod.read_token() is None:
         print("warning: no bot token at %s; chat intake stays offline"
               % config_mod.token_env_path(), file=sys.stderr)
+
+    _warn_empty_allowlist(cfg)
 
     if still_enabled:
         # Non-zero, though the config was written and everything else worked.

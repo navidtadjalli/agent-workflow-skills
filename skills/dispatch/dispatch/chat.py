@@ -13,6 +13,9 @@ reachable when this one is not.
 
 ``last_error`` is redacted before it is exposed: it ends up in ``state.json``,
 and the bot token is never copied there.
+
+The allowlist is the authentication boundary, and it fails closed: an empty one
+admits nobody, and a live transport cannot be built without one at all.
 """
 import json
 import urllib.parse
@@ -24,7 +27,20 @@ API = "https://api.telegram.org/bot%s/%s"
 class Chat:
     def __init__(self, token, allowlist=None, opener=None, timeout=30):
         self._token = token
-        self.allowlist = [str(c) for c in (allowlist or [])]
+        # A bare string is a list of characters to `for`, and "7" is a chat id
+        # somebody holds. One id written without brackets means that one id.
+        if isinstance(allowlist, (str, bytes)):
+            allowlist = [allowlist]
+        self.allowlist = [str(c) for c in (allowlist or []) if str(c)]
+        if not self.allowlist:
+            # Refusing to exist is the second half of failing closed. `allowed`
+            # denies an empty allowlist on its own; this makes a transport that
+            # has nobody to admit unconstructable, so a later widening of
+            # `allowed` cannot quietly reopen the door.
+            raise ValueError(
+                "chat_allowlist is empty: a live transport with no allowlist "
+                "would admit every chat. Set one with "
+                "`dispatch setup --chat <chat-id>`.")
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         # Health, for the surfaces that report on this one.
@@ -50,7 +66,14 @@ class Chat:
             return json.loads(response.read().decode())
 
     def allowed(self, chat_id):
-        return not self.allowlist or str(chat_id) in self.allowlist
+        """Deny by default: an empty allowlist means nobody, not everybody.
+
+        This is the whole authentication boundary of the system. It used to
+        read ``not self.allowlist or ...``, which turned a missing or corrupt
+        config.json -- whose defaults carry an empty allowlist -- into a bot
+        that answered every stranger, with no symptom to notice.
+        """
+        return bool(self.allowlist) and str(chat_id) in self.allowlist
 
     def poll(self, offset):
         """Return ``(messages, next_offset)``. Never raises on a bad response."""
@@ -101,6 +124,8 @@ class NullChat:
         self.failures = 0
 
     def allowed(self, chat_id):
+        """Safe as True: this transport polls nothing, so nothing is admitted
+        through it, and `send` only appends to a list."""
         return True
 
     def poll(self, offset):

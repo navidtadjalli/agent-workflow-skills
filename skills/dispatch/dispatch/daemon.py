@@ -146,15 +146,32 @@ class Daemon:
 
         Falling back to ``NullChat`` silently is the failure that looks most
         like success: the daemon runs, the queue is healthy, the watchdog is
-        quiet, and the only interface the user has answers nothing.
+        quiet, and the only interface the user has answers nothing. So each
+        reason there is no transport is printed once and carried on the
+        stand-in, where ``chat_status_line`` puts it in front of both status
+        surfaces.
+
+        The allowlist is checked before the token, because an empty allowlist
+        is the more dangerous of the two conditions and the one a corrupt
+        config.json produces silently. The daemon still starts: it keeps
+        draining the queue for `dispatch add`, and `dispatch status` can say
+        why chat is refused -- where a refusal to start would leave a crash
+        loop under the watchdog and nothing to read it from.
         """
+        allowlist = [str(c) for c in (self.config.get("chat_allowlist") or [])
+                     if str(c)]
+        if not allowlist:
+            reason = ("chat allowlist is empty · chat intake refused · set one "
+                      "with `dispatch setup --chat <chat-id>`")
+            print("warning: %s" % reason, file=sys.stderr)
+            return chat_mod.NullChat(reason=reason)
         token = config_mod.read_token()
         if not token:
             reason = "no bot token at %s · chat intake offline" % (
                 config_mod.token_env_path())
             print("warning: %s" % reason, file=sys.stderr)
             return chat_mod.NullChat(reason=reason)
-        return chat_mod.Chat(token, self.config.get("chat_allowlist"))
+        return chat_mod.Chat(token, allowlist)
 
     def _default_run_step(self, task, cwd):
         from . import worker

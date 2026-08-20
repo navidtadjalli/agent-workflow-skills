@@ -52,6 +52,21 @@ out of any error message before recording it.
 The bot token is never copied here. It is read at runtime from the channel env
 file.
 
+If `config.json` cannot be read -- a truncated write, a bad hand-edit -- every
+command says so on stderr and falls back to the defaults. The defaults carry an
+empty allowlist, which now means *nobody*, so the fallback refuses chat rather
+than opening it. `dispatch setup` keeps the unparseable file as
+`config.json.corrupt` before it writes a new one, because the repo overrides and
+chat ids in there are the hardest part to reconstruct.
+
+Config keys worth knowing (all optional; the rest are governor thresholds):
+
+```
+chat_allowlist   chat ids allowed to drive the daemon. Empty means nobody.
+projects_root    where repos are discovered (default ~/Projects)
+repos            alias -> path, for repos outside that root
+```
+
 ## What the governor actually knows
 
 Only `/usage` reports real plan percentages, and asking costs a request against
@@ -98,6 +113,7 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Mode stays `frozen` past the reset | Reset time was misparsed | `dispatch usage --poll`, then `dispatch resume` |
 | A lane reads `frozen` with a low session percentage | Its weekly window is at or above the soft limit | Nothing: it resumes when the week resets. `dispatch status` shows both windows |
 | The bot answers nothing, everything else looks healthy | Chat transport is failing | `dispatch status` prints the last transport error and how many polls have failed in a row |
+| The bot answers nobody, and `status` says the allowlist is empty | `config.json` is missing or did not parse, so the defaults are in force | `dispatch setup --chat <chat-id>`; check stderr for the `config.json.corrupt` line first |
 | Session gone, no explanation in the pane | The daemon died with it | `dispatch logs --daemon` falls back to `daemon.log`, which outlives the session |
 | Task `failed` with `checkpoint failed: ...` | The step's work could not be committed | Fix the repo (a stale lock, a conflicting ref), then re-add; the tree still holds the work |
 
@@ -107,3 +123,12 @@ Workers run without permission prompts, so repository content is untrusted input
 to an unattended agent. Every git repo under the projects root is dispatchable
 -- that is the trust boundary, and the `repos` chat verb is what prints it. Workers never push and never
 commit to the default branch; every checkpoint lands on the task branch.
+
+**The chat allowlist is the authentication boundary, and it fails closed.** An
+empty allowlist admits nobody: `Chat` refuses to be built without one, and the
+daemon runs with no chat transport, printing why at startup and reporting it in
+`dispatch status`, rather than answering every chat that finds the bot. It still
+starts, so the queue and `dispatch add` keep working while the allowlist is
+fixed -- a daemon that refused to start would just be relaunched by the watchdog
+every five minutes.
+

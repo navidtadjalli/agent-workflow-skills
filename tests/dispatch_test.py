@@ -1928,6 +1928,35 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertIn("no bot token", chat.last_error)
         self.assertIn("no bot token", err.getvalue())
 
+    def test_an_empty_allowlist_refuses_chat_rather_than_serving_everyone(self):
+        """A token and no allowlist is the corrupt-config shape. The daemon
+        must not build a live transport there: it reports the condition and
+        runs without one, the same way it does with no token at all."""
+        from dispatch import chat as chat_mod
+        from dispatch import daemon as daemon_mod
+
+        env = os.path.join(self.tmp.name, "token.env")
+        with open(env, "w") as fh:
+            fh.write("TELEGRAM_BOT_TOKEN=123456:SECRET-BOT-TOKEN\n")
+        daemon = self._daemon()
+        daemon.config["chat_allowlist"] = []
+        with mock.patch.dict(os.environ, {"DISPATCH_TOKEN_ENV": env}):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                chat = daemon._default_chat()
+
+        self.assertIsInstance(chat, chat_mod.NullChat)
+        self.assertIn("allowlist", chat.last_error)
+        self.assertIn("allowlist", err.getvalue())
+        self.assertNotIn("SECRET-BOT-TOKEN", chat.last_error + err.getvalue())
+
+        # And it is a standing condition on the surface that reports transport
+        # health, so `dispatch status` says why the bot is answering nobody.
+        daemon.chat = chat
+        with contextlib.redirect_stderr(io.StringIO()):
+            daemon.tick()
+        self.assertIn("allowlist",
+                      daemon_mod.chat_status_line(state.read_state()))
+
     # -- crash handling ------------------------------------------------------
 
     def test_a_tick_that_raises_does_not_take_the_daemon_with_it(self):
@@ -2458,6 +2487,26 @@ class TestCliLifecycle(_CliEnv):
         self.assertIn("-d", started)
         self.assertIn(cli.TMUX_SESSION, started)
 
+    def test_up_says_when_the_allowlist_would_refuse_every_chat(self):
+        """The cutover makes Telegram the only interface. Starting a daemon
+        whose allowlist is empty produces a bot that answers nobody, and every
+        other health surface stays green -- so `up` says it out loud, the same
+        way it does about a missing token."""
+        runner, _ = self._runner(alive=False)
+        code, _, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        # Still zero: the daemon runs the queue, and `dispatch add` still works.
+        self.assertEqual(code, 0)
+        self.assertIn("chat_allowlist is empty", err)
+        self.assertIn("dispatch setup --chat", err)
+
+    def test_up_is_quiet_about_an_allowlist_that_names_somebody(self):
+        state.write(config_mod.config_path(), {"chat_allowlist": ["7256243815"]})
+        runner, _ = self._runner(alive=False)
+        _, _, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertNotIn("chat_allowlist", err)
+
     def test_up_is_idempotent_when_alive(self):
         runner, calls = self._runner(alive=True)
         self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
@@ -2848,6 +2897,35 @@ class TestCliSetup(_CliEnv):
             self.assertFalse(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
         self.assertEqual(config_mod.load()["chat_allowlist"], ["7256243815"])
 
+    def test_setup_keeps_a_config_it_could_not_read_before_overwriting_it(self):
+        """`setup` merges onto `config.load()`, and a corrupt file loads as
+        defaults -- so writing would silently discard whatever repo overrides
+        and chat ids were in there. The bytes are kept next to it instead."""
+        config_mod.ensure_dirs()
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('{"chat_allowlist": ["7256243815"')  # a truncated write
+        path = self._settings()
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["1"]))
+        self.assertEqual(code, 0)
+        kept = config_mod.config_path() + ".corrupt"
+        self.assertIn(kept, err)
+        with open(kept) as fh:
+            self.assertEqual(fh.read(), '{"chat_allowlist": ["7256243815"')
+        self.assertEqual(config_mod.load()["chat_allowlist"], ["1"])
+
+    def test_setup_warns_when_it_writes_a_config_that_admits_nobody(self):
+        """`--chat` is the whole authentication boundary, and setup is where a
+        cutover would notice it was never passed."""
+        path = self._settings()
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=None))
+        self.assertEqual(code, 0)
+        self.assertIn("chat_allowlist is empty", err)
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["7256243815"]))
+        self.assertNotIn("chat_allowlist is empty", err)
+
     def test_setup_keeps_the_plugin_when_told_to_and_warns(self):
         path = self._settings()
         code, _, err = self._capture(cli.cmd_setup, _Args(
@@ -3150,7 +3228,9 @@ class TestChatTransportHealth(unittest.TestCase):
 
     def _chat(self, opener):
         from dispatch import chat as chat_mod
-        return chat_mod.Chat(self.TOKEN, opener=opener)
+        # An allowlist, because a live transport now refuses to exist without
+        # one: an empty allowlist is nobody, and there is nothing to poll for.
+        return chat_mod.Chat(self.TOKEN, ["1"], opener=opener)
 
     def test_a_failed_poll_is_counted_and_its_reason_kept(self):
         chat = self._chat(mock.Mock(side_effect=OSError("connection refused")))
@@ -3199,6 +3279,120 @@ class TestChatTransportHealth(unittest.TestCase):
         self.assertEqual(offline.failures, 0)
         self.assertEqual(offline.poll(3), ([], 3))
         self.assertIn("no bot token", offline.last_error)
+
+
+class TestChatAllowlist(unittest.TestCase):
+    """The allowlist is the whole authentication boundary after the cutover.
+
+    An empty one used to mean "everybody". ``config.load()`` falls back to the
+    defaults when config.json is missing or corrupt, and the default allowlist
+    is empty, so a truncated write or a bad hand-edit turned authentication off
+    while the bot went on answering normally -- and every message that reached
+    it could point an unattended agent at any repo under the projects root.
+    """
+
+    TOKEN = "123456:SECRET-BOT-TOKEN"
+
+    def _chat_mod(self):
+        from dispatch import chat as chat_mod
+        return chat_mod
+
+    def test_an_empty_allowlist_admits_nobody(self):
+        """Empty means nobody. This is the assertion the boundary rests on."""
+        chat = self._chat_mod().Chat(self.TOKEN, ["1"])
+        chat.allowlist = []  # what a corrupt or missing config used to produce
+        self.assertFalse(chat.allowed("1"))
+        self.assertFalse(chat.allowed("7256243815"))
+
+    def test_a_populated_allowlist_admits_only_what_it_lists(self):
+        chat = self._chat_mod().Chat(self.TOKEN, [7256243815])
+        self.assertTrue(chat.allowed("7256243815"))
+        self.assertTrue(chat.allowed(7256243815))
+        self.assertFalse(chat.allowed("7256243816"))
+        self.assertFalse(chat.allowed(""))
+
+    def test_a_live_transport_refuses_to_exist_without_an_allowlist(self):
+        """Defence in depth: even if `allowed` were widened again later, there
+        is no way to build a transport that has nobody to admit."""
+        for empty in (None, [], ()):
+            with self.assertRaises(ValueError):
+                self._chat_mod().Chat(self.TOKEN, empty)
+
+    def test_a_single_id_written_as_a_string_is_not_read_as_digits(self):
+        """`"chat_allowlist": "725..."` iterates into characters, and "7" is a
+        chat id someone could hold."""
+        chat = self._chat_mod().Chat(self.TOKEN, "7256243815")
+        self.assertEqual(chat.allowlist, ["7256243815"])
+        self.assertFalse(chat.allowed("7"))
+
+    def test_poll_drops_a_message_from_an_unlisted_chat(self):
+        payload = {"result": [
+            {"update_id": 1, "message": {"text": "status", "chat": {"id": 1},
+                                         "message_id": 11}},
+            {"update_id": 2, "message": {"text": "claude rm -rf on qpay",
+                                         "chat": {"id": 999}, "message_id": 12}}]}
+        chat = self._chat_mod().Chat(
+            self.TOKEN, ["1"],
+            opener=lambda request, timeout=None: _Response(payload))
+        messages, offset = chat.poll(0)
+        self.assertEqual([m["chat_id"] for m in messages], ["1"])
+        self.assertEqual(offset, 3)
+
+    def test_the_null_transport_admits_because_it_delivers_nothing(self):
+        """`NullChat.allowed` staying True is safe: it polls nothing, so there
+        is no message for it to admit, and it sends to a list."""
+        null = self._chat_mod().NullChat()
+        self.assertTrue(null.allowed("999"))
+        self.assertEqual(null.poll(0), ([], 0))
+
+
+class TestConfigIntegrity(unittest.TestCase):
+    """config.json carries a security boundary, so failing to read it is not
+    an event that may pass in silence."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = mock.patch.dict(os.environ, {"DISPATCH_HOME": self.tmp.name})
+        home.start()
+        self.addCleanup(home.stop)
+
+    def _load(self, overrides=None):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cfg = config_mod.load(overrides)
+        return cfg, err.getvalue()
+
+    def test_a_missing_config_is_normal_and_stays_silent(self):
+        """First run, and every DISPATCH_HOME a test points at."""
+        cfg, err = self._load()
+        self.assertEqual(err, "")
+        self.assertEqual(cfg["chat_allowlist"], [])
+
+    def test_a_corrupt_config_says_so_on_stderr(self):
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('{"chat_allowlist": ["7256243815"')  # a truncated write
+        cfg, err = self._load()
+        self.assertIn(config_mod.config_path(), err)
+        self.assertIn("allowlist", err)
+        # Falls back to defaults, which now admit nobody rather than everybody.
+        self.assertEqual(cfg["chat_allowlist"], [])
+
+    def test_a_config_that_is_not_an_object_is_corruption_too(self):
+        with open(config_mod.config_path(), "w") as fh:
+            fh.write('["chat_allowlist"]')
+        cfg, err = self._load()
+        self.assertIn("not an object", err)
+        self.assertEqual(cfg["chat_allowlist"], [])
+
+    def test_a_readable_config_still_loads_and_still_takes_overrides(self):
+        state.write(config_mod.config_path(),
+                    {"chat_allowlist": ["1"], "poll_floor": 5})
+        cfg, err = self._load()
+        self.assertEqual(err, "")
+        self.assertEqual(cfg["chat_allowlist"], ["1"])
+        self.assertEqual(cfg["poll_floor"], 5)
+        self.assertEqual(self._load({"poll_floor": 9})[0]["poll_floor"], 9)
 
 
 class TestStepStatusIsNotInherited(unittest.TestCase):
