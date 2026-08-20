@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["complete", "continue", "blocked"],
+      "description": "complete when the deliverable is done and verified, continue when another step is needed, blocked when only the user can decide"
+    },
+    "summary": {
+      "type": "string",
+      "description": "what this step actually changed"
+    },
+    "next": {
+      "type": "string",
+      "description": "what the following step should pick up, empty when complete"
+    }
+  },
+  "required": ["status", "summary", "next"],
+  "additionalProperties": false
+}

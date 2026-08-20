@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import governor, lanes, parser, scheduler, state, usage, winddown, worker  # noqa: E402
+from dispatch import backends, governor, lanes, parser, scheduler, state, usage, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -361,7 +361,7 @@ class TestWorkerContract(unittest.TestCase):
         envelope = ('{"session_id": "sess-9", "result": "did a thing\\n'
                     '```json\\n{\\"status\\": \\"continue\\", \\"summary\\": \\"half\\", '
                     '\\"next\\": \\"rest\\"}\\n```"}')
-        parsed = worker.parse_status(envelope)
+        parsed = worker.parse_status(envelope, "/unused")
         self.assertEqual(parsed["status"], "continue")
         self.assertEqual(parsed["session_id"], "sess-9")
         self.assertEqual(parsed["next"], "rest")
@@ -369,13 +369,14 @@ class TestWorkerContract(unittest.TestCase):
     def test_last_block_wins(self):
         text = ('```json\n{"status": "continue", "summary": "a"}\n```\n'
                 '```json\n{"status": "complete", "summary": "b"}\n```')
-        self.assertEqual(worker.parse_status(text)["status"], "complete")
+        self.assertEqual(worker.parse_status(text, "/unused")["status"], "complete")
 
     def test_missing_block_is_not_a_status(self):
-        self.assertIsNone(worker.parse_status("I finished everything!")["status"])
+        self.assertIsNone(worker.parse_status("I finished everything!", "/unused")["status"])
 
     def test_invalid_status_value_rejected(self):
-        self.assertIsNone(worker.parse_status('```json\n{"status": "done"}\n```')["status"])
+        self.assertIsNone(
+            worker.parse_status('```json\n{"status": "done"}\n```', "/unused")["status"])
 
     def test_next_state_matrix(self):
         self.assertEqual(worker.next_state("complete", "running"), "done")
@@ -385,15 +386,16 @@ class TestWorkerContract(unittest.TestCase):
         self.assertEqual(worker.next_state(None, "running"), "failed")
 
     def test_house_rules_name_the_task_branch(self):
-        rules = worker.house_rules({"branch": "tg/t-0042"})
+        rules = backends.claude.house_rules({"branch": "tg/t-0042"})
         self.assertIn("tg/t-0042", rules)
         self.assertIn("Never push", rules)
 
     def test_resume_flag_only_with_a_session(self):
         task = {"prompt": "do", "branch": "tg/t-1", "session_id": None}
-        self.assertNotIn("--resume", worker.build_command(task))
+        self.assertNotIn("--resume", worker.build_command(
+            task, "/p/prompt.txt", "/repo", "/unused"))
         task["session_id"] = "sess-1"
-        argv = worker.build_command(task)
+        argv = worker.build_command(task, "/p/prompt.txt", "/repo", "/unused")
         self.assertEqual(argv[argv.index("--resume") + 1], "sess-1")
 
 
@@ -649,6 +651,155 @@ class TestStateMigration(unittest.TestCase):
     def test_new_task_defaults_to_claude(self):
         queue = dict(state.QUEUE_EMPTY, tasks=[])
         self.assertEqual(state.new_task(queue, "qpay", "x")["agent"], "claude")
+
+
+class TestBackends(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.task = {"id": "t-0001", "repo": "qpay", "prompt": "do a thing",
+                     "branch": "tg/t-0001", "agent": "claude", "session_id": None}
+
+    def test_registry_resolves_both(self):
+        self.assertIs(backends.get("claude"), backends.claude)
+        self.assertIs(backends.get("codex"), backends.codex)
+
+    def test_registry_defaults_to_claude(self):
+        self.assertIs(backends.get("gemini"), backends.claude)
+        self.assertIs(backends.get(None), backends.claude)
+
+    def test_claude_reads_prompt_from_stdin(self):
+        argv = backends.claude.build_command(
+            self.task, "/p/prompt.txt", "/repo", self.tmp.name)
+        self.assertEqual(argv[:3], ["claude", "-p", "-"])
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("do a thing", argv)
+
+    def test_claude_resume_is_an_option_pair(self):
+        self.assertEqual(backends.claude.resume_args("abc"), ["--resume", "abc"])
+        self.assertEqual(backends.claude.resume_args(None), [])
+
+    def test_codex_resume_is_a_positional_subcommand(self):
+        """codex continues with `exec resume <id>`, not a trailing flag."""
+        self.assertEqual(backends.codex.resume_args("abc"), ["resume", "abc"])
+        self.assertEqual(backends.codex.resume_args(None), [])
+
+    def test_codex_places_resume_before_the_prompt_marker(self):
+        task = dict(self.task, agent="codex", session_id="abc")
+        argv = backends.codex.build_command(
+            task, "/p/prompt.txt", "/repo", self.tmp.name)
+        self.assertEqual(argv[:4], ["codex", "exec", "resume", "abc"])
+        self.assertLess(argv.index("resume"), argv.index("-"))
+
+    def test_codex_command_shape(self):
+        argv = backends.codex.build_command(
+            dict(self.task, agent="codex"), "/p/prompt.txt", "/repo", self.tmp.name)
+        self.assertEqual(argv[:3], ["codex", "exec", "-"])
+        self.assertIn("--json", argv)
+        self.assertEqual(argv[argv.index("-C") + 1], "/repo")
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertTrue(argv[argv.index("--output-schema") + 1].endswith(
+            "status.schema.json"))
+        self.assertEqual(argv[argv.index("-o") + 1],
+                         os.path.join(self.tmp.name, "last.json"))
+
+    def test_codex_schema_file_is_valid_json_and_requires_status(self):
+        with open(backends.codex.SCHEMA_PATH) as fh:
+            schema = json.load(fh)
+        self.assertIn("status", schema["properties"])
+        self.assertIn("status", schema["required"])
+
+    def test_codex_parses_the_last_message_file(self):
+        with open(os.path.join(self.tmp.name, "last.json"), "w") as fh:
+            json.dump({"status": "complete", "summary": "did it", "next": ""}, fh)
+        result = backends.codex.parse_result("", self.tmp.name)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["summary"], "did it")
+
+    def test_codex_missing_last_message_is_a_failure_not_a_crash(self):
+        result = backends.codex.parse_result("", self.tmp.name)
+        self.assertIsNone(result["status"])
+
+    def test_codex_malformed_last_message_is_a_failure(self):
+        with open(os.path.join(self.tmp.name, "last.json"), "w") as fh:
+            fh.write("{not json")
+        self.assertIsNone(backends.codex.parse_result("", self.tmp.name)["status"])
+
+    def test_codex_rejects_an_invalid_status_value(self):
+        with open(os.path.join(self.tmp.name, "last.json"), "w") as fh:
+            json.dump({"status": "finished-ish", "summary": ""}, fh)
+        self.assertIsNone(backends.codex.parse_result("", self.tmp.name)["status"])
+
+    def test_codex_finds_a_session_id_under_any_of_its_names(self):
+        for key in ("thread_id", "session_id", "conversation_id"):
+            stream = json.dumps({"type": "thread.started", key: "sess-9"})
+            result = backends.codex.parse_result(stream, self.tmp.name)
+            self.assertEqual(result["session_id"], "sess-9", key)
+
+    def test_codex_without_a_session_id_returns_none(self):
+        result = backends.codex.parse_result('{"type":"item.done"}', self.tmp.name)
+        self.assertIsNone(result["session_id"])
+
+    def test_claude_fence_parsing_is_unchanged(self):
+        output = json.dumps({"session_id": "s1", "result":
+                             'done\n```json\n{"status": "complete", "summary": "ok"}\n```'})
+        result = backends.claude.parse_result(output, self.tmp.name)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["session_id"], "s1")
+
+    def test_codex_house_rules_omit_the_fence_instruction(self):
+        rules = backends.codex.house_rules(self.task)
+        self.assertNotIn("```json", rules)
+        self.assertIn("tg/t-0001", rules)
+        self.assertIn("blocked", rules)
+
+    def test_claude_house_rules_keep_the_fence_instruction(self):
+        self.assertIn("```json", backends.claude.house_rules(self.task))
+
+
+class TestPromptFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_prompt_file_holds_prompt_plus_house_rules(self):
+        task = {"id": "t-0002", "repo": "qpay", "prompt": "ship it",
+                "branch": "tg/t-0002", "agent": "claude"}
+        path = worker.write_prompt(task, self.tmp.name)
+        body = open(path).read()
+        self.assertTrue(body.startswith("ship it"))
+        self.assertIn("tg/t-0002", body)
+
+    def test_prompt_with_shell_metacharacters_survives_verbatim(self):
+        """The reason the prompt is a file: chat text is arbitrary."""
+        nasty = 'rm -rf $HOME; echo "`whoami`" && exit 1'
+        task = {"id": "t-0003", "repo": "qpay", "prompt": nasty,
+                "branch": "tg/t-0003", "agent": "claude"}
+        self.assertIn(nasty, open(worker.write_prompt(task, self.tmp.name)).read())
+
+    def test_prompt_is_fed_on_stdin_not_argv(self):
+        recorded = {}
+
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", None
+
+            def poll(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            recorded["argv"] = argv
+            recorded["stdin"] = kwargs.get("stdin")
+            return FakeProcess()
+
+        task = {"id": "t-0004", "repo": "qpay", "prompt": "secret words",
+                "branch": "tg/t-0004", "agent": "claude", "session_id": None}
+        worker.run_step(task, self.tmp.name, CONFIG, popen=fake_popen,
+                        task_dir=self.tmp.name)
+        self.assertNotIn("secret words", " ".join(recorded["argv"]))
+        self.assertIsNotNone(recorded["stdin"])
 
 
 if __name__ == "__main__":

@@ -67,7 +67,8 @@ class Daemon:
 
     def _default_run_step(self, task, cwd):
         from . import worker
-        return worker.run_step(task, cwd, self.config)
+        return worker.run_step(task, cwd, self.config,
+                               task_dir=config_mod.task_dir(task["id"]))
 
     def _default_checkpoint(self, task, cwd, message):
         from . import worker

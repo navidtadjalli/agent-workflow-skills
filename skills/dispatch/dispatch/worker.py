@@ -4,84 +4,46 @@ A "step" is one headless agent invocation. Steps are deliberately small: the
 agent is told to do one coherent chunk and stop, so that the wind-down path
 always has a clean seam to stop at, and so a step that dies costs little.
 
-Every step ends by parsing a fenced JSON status block out of the agent's own
-output. That block -- not an exit code, not a heuristic -- decides whether the
-task is complete, wants another step, or is blocked.
+Every step ends by asking the task's backend to parse its self-reported
+status. That status -- not an exit code, not a heuristic -- decides whether
+the task is complete, wants another step, or is blocked.
 """
-import json
 import os
-import re
 import signal
 import subprocess
 
-from . import usage
-
-HOUSE_RULES = """
-Operating rules for this run:
-- Do one coherent chunk of work, then stop. Do not try to finish everything.
-- Commit checkpoints to the branch {branch}. Never commit to main.
-- Never push. Never force-push. Never rewrite published history.
-- If you need a decision only the user can make, stop and report blocked.
-- End your final message with a fenced json block, exactly:
-
-```json
-{{"status": "complete|continue|blocked", "summary": "...", "next": "..."}}
-```
-"""
-
-FENCE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
-VALID = ("complete", "continue", "blocked")
-
-
-def house_rules(task):
-    return HOUSE_RULES.format(branch=task["branch"]).strip()
+from . import backends, config as config_mod, lanes, usage
 
 
 def build_prompt(task):
-    return "%s\n\n%s" % (task["prompt"].strip(), house_rules(task))
+    """The full text the agent receives: the request, then the house rules."""
+    backend = backends.get(lanes.of(task))
+    return "%s\n\n%s" % (task["prompt"].strip(), backend.house_rules(task))
 
 
-def build_command(task, unsafe=True):
-    """The argv for one step. ``--resume`` continues a live session."""
-    argv = ["claude", "-p", build_prompt(task), "--output-format", "json"]
-    if unsafe:
-        argv.append("--dangerously-skip-permissions")
-    if task.get("session_id"):
-        argv.extend(["--resume", task["session_id"]])
-    return argv
+def write_prompt(task, task_dir):
+    """Persist the prompt beside the task's other artifacts, return its path.
 
-
-def parse_status(output):
-    """Extract the agent's self-reported status block.
-
-    Accepts either raw text or the ``--output-format json`` envelope, whose
-    ``result`` field holds the text the fence lives in.
+    The prompt is a file rather than an argv element for three reasons, in
+    order of how likely each is to bite: chat text is arbitrary and quoting it
+    is a correctness problem; a long prompt can exceed ARG_MAX; and the exact
+    bytes the agent saw belong next to steps.jsonl when a step has to be
+    diagnosed later.
     """
-    text = output or ""
-    session_id = None
-    stripped = text.strip()
-    if stripped.startswith("{"):
-        try:
-            envelope = json.loads(stripped)
-        except ValueError:
-            envelope = None
-        if isinstance(envelope, dict):
-            session_id = envelope.get("session_id")
-            if isinstance(envelope.get("result"), str):
-                text = envelope["result"]
+    os.makedirs(task_dir, exist_ok=True)
+    path = os.path.join(task_dir, "prompt.txt")
+    with open(path, "w") as handle:
+        handle.write(build_prompt(task))
+    return path
 
-    blocks = FENCE.findall(text)
-    for raw in reversed(blocks):
-        try:
-            block = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(block, dict) and block.get("status") in VALID:
-            return {"status": block["status"],
-                    "summary": block.get("summary") or "",
-                    "next": block.get("next") or "",
-                    "session_id": session_id}
-    return {"status": None, "summary": "", "next": "", "session_id": session_id}
+
+def build_command(task, prompt_path, cwd, task_dir, unsafe=True):
+    return backends.get(lanes.of(task)).build_command(
+        task, prompt_path, cwd, task_dir, unsafe=unsafe)
+
+
+def parse_status(output, task_dir, task=None):
+    return backends.get(lanes.of(task or {})).parse_result(output, task_dir)
 
 
 def next_state(status, mode):
@@ -100,7 +62,7 @@ def next_state(status, mode):
     return "paused" if mode != "running" else "queued"
 
 
-def run_step(task, cwd, config, env=None, popen=None, sleeper=None):
+def run_step(task, cwd, config, env=None, popen=None, sleeper=None, task_dir=None):
     """Execute one step under a wall-clock cap. Returns a result dict.
 
     ``popen`` and ``sleeper`` are injected in tests. The termination path is
@@ -108,17 +70,22 @@ def run_step(task, cwd, config, env=None, popen=None, sleeper=None):
     chance to finish its commit, but not indefinitely.
     """
     popen = popen or subprocess.Popen
-    argv = build_command(task)
-    process = popen(argv, cwd=cwd, env=env or os.environ.copy(),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    timed_out = False
-    try:
-        output, _ = process.communicate(timeout=config["step_timeout"])
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        output = _terminate(process, config, sleeper)
+    task_dir = task_dir or config_mod.task_dir(task["id"])
+    prompt_path = write_prompt(task, task_dir)
+    argv = build_command(task, prompt_path, cwd, task_dir)
 
-    result = parse_status(output)
+    with open(prompt_path) as prompt_handle:
+        process = popen(argv, cwd=cwd, env=env or os.environ.copy(),
+                        stdin=prompt_handle,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        timed_out = False
+        try:
+            output, _ = process.communicate(timeout=config["step_timeout"])
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            output = _terminate(process, config, sleeper)
+
+    result = parse_status(output, task_dir, task)
     result["timed_out"] = timed_out
     result["returncode"] = process.returncode
     result["output"] = output or ""
