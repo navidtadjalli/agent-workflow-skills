@@ -313,6 +313,80 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(reasons[0][0], "t-0001")
 
 
+class TestLaneAdmission(unittest.TestCase):
+    def _queue(self):
+        return {"next_id": 3, "tasks": [
+            {"id": "t-0001", "repo": "qpay", "agent": "claude", "state": "queued",
+             "priority": 5, "deps": [], "isolation": "repo"},
+            {"id": "t-0002", "repo": "poook", "agent": "codex", "state": "queued",
+             "priority": 5, "deps": [], "isolation": "repo"},
+        ]}
+
+    def _ctx(self, queue, **over):
+        ctx = {"mode": "running", "queue": queue, "running": 0,
+               "session_pct": 10.0, "week_pct": 10.0, "stale": False,
+               "est_cost_pct": 1.0, "config": CONFIG,
+               "lock_free": lambda name: True}
+        ctx.update(over)
+        return ctx
+
+    def test_runnable_filters_by_lane(self):
+        queue = self._queue()
+        self.assertEqual([t["id"] for t in scheduler.runnable(queue, "claude")],
+                         ["t-0001"])
+        self.assertEqual([t["id"] for t in scheduler.runnable(queue, "codex")],
+                         ["t-0002"])
+
+    def test_runnable_unfiltered_returns_both(self):
+        self.assertEqual(len(scheduler.runnable(self._queue())), 2)
+
+    def test_a_task_without_an_agent_is_in_the_claude_lane(self):
+        queue = {"next_id": 2, "tasks": [
+            {"id": "t-0001", "repo": "qpay", "state": "queued", "priority": 5,
+             "deps": [], "isolation": "repo"}]}
+        self.assertEqual(len(scheduler.runnable(queue, "claude")), 1)
+        self.assertEqual(len(scheduler.runnable(queue, "codex")), 0)
+
+    def test_one_lane_frozen_does_not_block_the_other(self):
+        queue = self._queue()
+        claude_task, codex_task = queue["tasks"]
+        frozen = self._ctx(queue, mode="frozen")
+        ok, reason = scheduler.admit(claude_task, frozen)
+        self.assertFalse(ok)
+        self.assertIn("frozen", reason)
+        ok, _ = scheduler.admit(codex_task, self._ctx(queue, mode="running"))
+        self.assertTrue(ok)
+
+    def test_repo_lock_is_shared_across_lanes(self):
+        """A codex worker and a claude worker must not share a checkout."""
+        queue = self._queue()
+        queue["tasks"][1]["repo"] = "qpay"
+        held = {"repo-qpay"}
+        ctx = self._ctx(queue, lock_free=lambda name: name not in held)
+        ok, reason = scheduler.admit(queue["tasks"][1], ctx)
+        self.assertFalse(ok)
+        self.assertIn("busy", reason)
+
+    def test_worktree_isolation_still_bypasses_the_repo_lock(self):
+        queue = self._queue()
+        queue["tasks"][1]["repo"] = "qpay"
+        queue["tasks"][1]["isolation"] = "worktree"
+        held = {"repo-qpay"}
+        ctx = self._ctx(queue, lock_free=lambda name: name not in held)
+        ok, _ = scheduler.admit(queue["tasks"][1], ctx)
+        self.assertTrue(ok)
+
+    def test_per_lane_concurrency_counts_only_that_lane(self):
+        queue = self._queue()
+        ctx = self._ctx(queue, running=0, session_pct=70.0)
+        ok, _ = scheduler.admit(queue["tasks"][1], ctx)
+        self.assertTrue(ok)
+        ctx = self._ctx(queue, running=1, session_pct=70.0)
+        ok, reason = scheduler.admit(queue["tasks"][1], ctx)
+        self.assertFalse(ok)
+        self.assertIn("concurrency", reason)
+
+
 class TestWindDown(unittest.TestCase):
     def test_stays_running_below_soft(self):
         self.assertEqual(winddown.next_mode("running", 50.0, 1, CONFIG), "running")

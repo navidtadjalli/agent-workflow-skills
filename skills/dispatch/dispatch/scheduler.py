@@ -4,7 +4,7 @@ Every predicate is a pure function of an injected context so the whole decision
 surface is testable without a filesystem, a clock, or a live plan.
 """
 
-from . import governor
+from . import governor, lanes
 
 
 def lock_name(task):
@@ -26,9 +26,16 @@ def sort_key(task):
             task["id"])
 
 
-def runnable(queue):
-    return sorted((t for t in queue["tasks"] if t["state"] in ("queued", "paused")),
-                  key=sort_key)
+def runnable(queue, agent=None):
+    """Tasks eligible to start, optionally narrowed to one lane.
+
+    ``agent=None`` returns every lane, which is what the CLI and the status
+    surfaces want; the daemon passes a lane, because admission is per lane.
+    """
+    tasks = (t for t in queue["tasks"] if t["state"] in ("queued", "paused"))
+    if agent is not None:
+        tasks = (t for t in tasks if lanes.of(t) == agent)
+    return sorted(tasks, key=sort_key)
 
 
 def admit(task, ctx):
