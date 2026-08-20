@@ -213,8 +213,10 @@ class Daemon:
         if kind == "queue":
             return self.queue_line()
         if kind == "help":
-            return ("run <task> on <repo> · status · queue · usage · "
-                    "logs <id> · cancel <id> · pause · resume")
+            return ("claude <task> on <repo> · codex <task> on <repo> · "
+                    "status · queue · usage · usage poll · sessions · repos · "
+                    "logs <id> · cancel <id> · retry <id> · "
+                    "pause [lane] · resume [lane]")
         if kind == "pause":
             with state.mutate_state() as doc:
                 doc["mode"] = {lane: "paused" for lane in lanes.ALL}

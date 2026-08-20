@@ -952,5 +952,85 @@ class TestRepoDiscovery(unittest.TestCase):
         self.assertIn("3 folders", text)
 
 
+class TestAgentVerbs(unittest.TestCase):
+    def test_claude_verb_with_repo(self):
+        command = parser.parse("claude fix the failing auth test on qpay-backend")
+        self.assertEqual(command["kind"], "run")
+        self.assertEqual(command["agent"], "claude")
+        self.assertEqual(command["repo"], "qpay-backend")
+        self.assertEqual(command["prompt"], "fix the failing auth test")
+
+    def test_codex_verb_with_repo(self):
+        command = parser.parse("codex bump the deps on poook")
+        self.assertEqual((command["agent"], command["repo"], command["prompt"]),
+                         ("codex", "poook", "bump the deps"))
+
+    def test_agent_colon_form(self):
+        command = parser.parse("codex qpay: rerun the migration")
+        self.assertEqual((command["agent"], command["repo"], command["prompt"]),
+                         ("codex", "qpay", "rerun the migration"))
+
+    def test_agent_verb_with_worktree(self):
+        command = parser.parse("codex audit the deps on escrow in a worktree")
+        self.assertEqual(command["isolation"], "worktree")
+        self.assertEqual(command["repo"], "escrow")
+
+    def test_bare_agent_verb_demands_a_repo(self):
+        command = parser.parse("claude fix the failing auth test")
+        self.assertEqual(command["kind"], "need_repo")
+        self.assertEqual(command["agent"], "claude")
+
+    def test_run_verb_still_defaults_to_claude(self):
+        command = parser.parse("run the migration on qpay-backend")
+        self.assertEqual(command["kind"], "run")
+        self.assertEqual(command["agent"], "claude")
+
+    def test_run_verb_wins_over_a_prompt_starting_with_an_agent_name(self):
+        """`run claude tests on qpay` is a run, whose prompt is `claude tests`."""
+        command = parser.parse("run claude tests on qpay")
+        self.assertEqual(command["agent"], "claude")
+        self.assertEqual(command["prompt"], "claude tests")
+
+    def test_bare_agent_word_alone_is_not_a_run(self):
+        self.assertEqual(parser.parse("claude")["kind"], "unparsed")
+
+
+class TestReadVerbs(unittest.TestCase):
+    def test_usage_is_free_by_default(self):
+        command = parser.parse("usage")
+        self.assertEqual(command["kind"], "usage")
+        self.assertFalse(command["poll"])
+
+    def test_usage_poll_spends_a_request(self):
+        for text in ("usage poll", "usage --poll", "/usage poll"):
+            command = parser.parse(text)
+            self.assertEqual(command["kind"], "usage", text)
+            self.assertTrue(command["poll"], text)
+
+    def test_sessions_unfiltered(self):
+        command = parser.parse("sessions")
+        self.assertEqual(command["kind"], "sessions")
+        self.assertIsNone(command["project"])
+
+    def test_sessions_filtered(self):
+        self.assertEqual(parser.parse("sessions qpay")["project"], "qpay")
+
+    def test_repos_has_aliases(self):
+        for text in ("repos", "projects", "/repos"):
+            self.assertEqual(parser.parse(text)["kind"], "repos", text)
+
+    def test_pause_defaults_to_both_lanes(self):
+        command = parser.parse("pause")
+        self.assertEqual(command["kind"], "pause")
+        self.assertIsNone(command["lane"])
+
+    def test_pause_can_name_a_lane(self):
+        self.assertEqual(parser.parse("pause codex")["lane"], "codex")
+        self.assertEqual(parser.parse("resume claude")["lane"], "claude")
+
+    def test_pause_with_a_nonsense_lane_is_not_a_pause(self):
+        self.assertNotEqual(parser.parse("pause everything")["kind"], "pause")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
