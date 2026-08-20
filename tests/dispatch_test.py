@@ -4,10 +4,13 @@
 No network, no subprocesses, no real clock. Every value the daemon would read
 from the world is injected, so these tests assert on the logic itself.
 """
+import contextlib
 import inspect
+import io
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -18,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import backends, governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown, worker  # noqa: E402
+from dispatch import backends, cli, governor, lanes, parser, repos, scheduler, sessions, state, usage, volume, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -447,6 +450,35 @@ class TestWindDown(unittest.TestCase):
 
     def test_frozen_is_sticky(self):
         self.assertEqual(winddown.next_mode("frozen", 5.0, 0, CONFIG), "frozen")
+
+    def test_paused_is_sticky_below_the_soft_limit(self):
+        self.assertEqual(winddown.next_mode(winddown.PAUSED, 5.0, 0, CONFIG),
+                         winddown.PAUSED)
+
+    def test_paused_is_sticky_above_the_soft_limit(self):
+        """A pause that converts to frozen auto-resumes itself later.
+
+        `can_resume` only fires on `frozen`, so a lane the user paused by hand
+        while usage was high used to be handed back to the scheduler the moment
+        the window reset -- a control command that reported success and did not
+        hold, on the only surface the user has.
+        """
+        self.assertEqual(winddown.next_mode(winddown.PAUSED, 99.0, 0, CONFIG),
+                         winddown.PAUSED)
+        self.assertEqual(winddown.next_mode(winddown.PAUSED, 99.0, 1, CONFIG),
+                         winddown.PAUSED)
+
+    def test_paused_is_sticky_when_the_reading_is_unusable(self):
+        self.assertEqual(winddown.next_mode(winddown.PAUSED, None, 0, CONFIG),
+                         winddown.PAUSED)
+        self.assertEqual(
+            winddown.next_mode(winddown.PAUSED, 99.0, 0, CONFIG, stale=True),
+            winddown.PAUSED)
+
+    def test_a_paused_lane_never_satisfies_can_resume(self):
+        """Nothing but an explicit resume may take a lane out of paused."""
+        doc = {"mode": winddown.PAUSED, "armed_resume_at": None}
+        self.assertFalse(winddown.can_resume(doc, 3.0, 5100.0, CONFIG, False)[0])
 
     def test_unknown_usage_never_escalates(self):
         self.assertEqual(winddown.next_mode("running", None, 0, CONFIG), "running")
@@ -1456,6 +1488,54 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.RUNNING)
         self.assertIn("paused codex", daemon.chat.sent[0][1])
 
+    def test_a_paused_lane_is_never_resumed_by_a_usage_reading(self):
+        """The tick may not undo a pause, however the window moves.
+
+        Above the soft limit the pre-fix machine turned `paused` into `frozen`,
+        and `frozen` resumes itself once a fresh reading confirms the reset --
+        so a lane the user paused by hand quietly started spending again.
+        """
+        daemon = self._daemon(claude_pct=99.0)
+        daemon.set_mode("pause", lanes.CLAUDE)
+        daemon.tick()
+        doc = state.read_state()
+        self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.PAUSED)
+        self.assertEqual(doc["mode"][lanes.CODEX], winddown.RUNNING)
+
+        # The window resets: a frozen lane would come back here, a paused one
+        # must not. Past poll_idle, so the tick takes a fresh reading.
+        self.now += 700
+        daemon = self._daemon(claude_pct=5.0)
+        daemon.tick()
+        self.assertEqual(state.read_state()["mode"][lanes.CLAUDE], winddown.PAUSED)
+
+        daemon.set_mode("resume", lanes.CLAUDE)
+        daemon.tick()
+        self.assertEqual(state.read_state()["mode"][lanes.CLAUDE], winddown.RUNNING)
+
+    def test_a_limit_error_does_not_overwrite_a_pause(self):
+        """The user pauses while a step is in flight, and the step hits the wall.
+
+        Freezing the lane here would arm a resume, and the lane would let itself
+        go again at the reset -- the same pause discarded through another door.
+        The limit is still recorded, so resuming early does not walk back in.
+        """
+        def run_step(task, cwd):
+            daemon.set_mode("pause", lanes.CLAUDE)
+            return {"status": "continue", "summary": "hit the wall", "next": "",
+                    "output": "", "limit_reset_at": self.now + 3600,
+                    "session_id": None, "timed_out": False}
+
+        daemon = self._daemon(run_step=run_step)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        doc = state.read_state()
+        self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.PAUSED)
+        self.assertIsNone(doc["armed_resume_at"][lanes.CLAUDE])
+        self.assertEqual(doc["governor"]["session_pct"], 100.0)
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "paused")
+
     def test_a_chat_poll_result_is_not_reverted_by_the_same_tick(self):
         """`usage poll` spends a real request; discarding its answer at the end
         of the tick would spend it for nothing."""
@@ -1625,6 +1705,415 @@ class _ScriptedChat:
         self.sent.append((chat_id, text))
         return True
 
+
+class _Args:
+    """Stands in for an argparse namespace, with only the attrs a test sets."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _CliEnv(unittest.TestCase):
+    """Base for CLI tests: every root the CLI reads lives in a temp tree.
+
+    The daemon injects its clock, its transcript counter and its codex reading;
+    the CLI has no such seams, so the roots themselves are pointed elsewhere.
+    Without that, `dispatch status` reads the developer's real ~/.claude and
+    ~/.codex.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.transcripts = os.path.join(self.tmp.name, "transcripts")
+        self.codex_logs = os.path.join(self.tmp.name, "codex-sessions")
+        patcher = mock.patch.dict(os.environ, {
+            "DISPATCH_HOME": os.path.join(self.tmp.name, "home"),
+            "DISPATCH_TRANSCRIPTS": self.transcripts,
+            "DISPATCH_CODEX_SESSIONS": self.codex_logs,
+            "DISPATCH_TOKEN_ENV": os.path.join(self.tmp.name, "absent.env"),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _capture(self, func, args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = func(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def _write_codex_limits(self, session_pct, week_pct, now):
+        directory = os.path.join(self.codex_logs, "2026", "08", "20")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "a.jsonl"), "w") as fh:
+            fh.write(json.dumps({"payload": {"info": {"rate_limits": {
+                "primary": {"used_percent": session_pct, "window_minutes": 300,
+                            "resets_at": now + 3600},
+                "secondary": {"used_percent": week_pct, "window_minutes": 10080,
+                              "resets_at": now + 86400}}}}}) + "\n")
+
+
+class TestConfiguredRoots(_CliEnv):
+    """The two read-only roots the CLI cannot be handed as arguments."""
+
+    def test_transcript_tokens_follows_the_configured_root(self):
+        now = time.time()
+        directory = os.path.join(self.transcripts, "-home-someone-proj")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "session.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+                "message": {"id": "m1", "usage": {"input_tokens": 7,
+                                                  "output_tokens": 3}}}) + "\n")
+        self.assertEqual(usage.transcript_tokens(now), 10)
+
+    def test_transcript_tokens_still_takes_an_explicit_root(self):
+        self.assertEqual(usage.transcript_tokens(
+            time.time(), root=os.path.join(self.tmp.name, "nothing")), 0)
+
+    def test_the_codex_governor_follows_the_configured_root(self):
+        now = time.time()
+        self._write_codex_limits(42.0, 8.0, now)
+        reading = governor.codex.estimate(now)
+        self.assertEqual(reading["session_pct"], 42.0)
+        self.assertEqual(reading["source"], "codex-logs")
+
+
+class TestCliLanes(_CliEnv):
+    """`status`, `pause` and `resume` speak about both lanes, or one by name."""
+
+    def test_status_reports_the_mode_and_usage_of_both_lanes(self):
+        now = time.time()
+        self._write_codex_limits(42.0, 8.0, now)
+        code, out, _ = self._capture(cli.cmd_status, _Args())
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"claude\s+running")
+        self.assertRegex(out, r"codex\s+running")
+        self.assertIn("42%", out)
+        self.assertIn("queue", out)
+
+    def test_status_tells_the_truth_about_a_single_paused_lane(self):
+        self._capture(cli.cmd_pause, _Args(lane=lanes.CODEX))
+        _, out, _ = self._capture(cli.cmd_status, _Args())
+        self.assertRegex(out, r"claude\s+running")
+        self.assertRegex(out, r"codex\s+paused")
+
+    def test_status_names_the_lane_whose_resume_is_armed(self):
+        with state.mutate_state() as doc:
+            doc["mode"][lanes.CODEX] = winddown.FROZEN
+            doc["armed_resume_at"][lanes.CODEX] = time.time() + 3600
+        _, out, _ = self._capture(cli.cmd_status, _Args())
+        armed = [line for line in out.splitlines() if "resume armed" in line]
+        self.assertEqual(len(armed), 1)
+        self.assertIn(lanes.CODEX, armed[0])
+
+    def test_pause_takes_one_lane_and_leaves_the_other_alone(self):
+        code, out, _ = self._capture(cli.cmd_pause, _Args(lane=lanes.CODEX))
+        self.assertEqual(code, 0)
+        self.assertIn(lanes.CODEX, out)
+        doc = state.read_state()
+        self.assertEqual(doc["mode"][lanes.CODEX], winddown.PAUSED)
+        self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.RUNNING)
+
+    def test_a_bare_pause_and_resume_still_mean_both_lanes(self):
+        self._capture(cli.cmd_pause, _Args(lane=None))
+        self.assertEqual(state.read_state()["mode"],
+                         {lanes.CLAUDE: winddown.PAUSED, lanes.CODEX: winddown.PAUSED})
+        self._capture(cli.cmd_resume, _Args(lane=None))
+        self.assertEqual(state.read_state()["mode"],
+                         {lanes.CLAUDE: winddown.RUNNING, lanes.CODEX: winddown.RUNNING})
+
+    def test_resume_clears_only_the_named_lanes_armed_timer(self):
+        with state.mutate_state() as doc:
+            doc["mode"] = {lanes.CLAUDE: winddown.FROZEN, lanes.CODEX: winddown.FROZEN}
+            doc["armed_resume_at"] = {lanes.CLAUDE: 111.0, lanes.CODEX: 222.0}
+        self._capture(cli.cmd_resume, _Args(lane=lanes.CLAUDE))
+        doc = state.read_state()
+        self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.RUNNING)
+        self.assertIsNone(doc["armed_resume_at"][lanes.CLAUDE])
+        self.assertEqual(doc["mode"][lanes.CODEX], winddown.FROZEN)
+        self.assertEqual(doc["armed_resume_at"][lanes.CODEX], 222.0)
+
+    def test_the_cli_and_the_chat_verbs_write_the_same_thing(self):
+        """One implementation, so the two surfaces cannot drift apart."""
+        from dispatch import daemon as daemon_mod
+        self._capture(cli.cmd_pause, _Args(lane=lanes.CODEX))
+        from_cli = state.read_state()["mode"]
+        self._capture(cli.cmd_resume, _Args(lane=None))
+        daemon_mod.set_mode("pause", lanes.CODEX)
+        self.assertEqual(state.read_state()["mode"], from_cli)
+
+    def test_the_parser_accepts_a_lane_after_pause_and_resume(self):
+        parser_ = cli.build_parser()
+        self.assertEqual(parser_.parse_args(["pause", "codex"]).lane, "codex")
+        self.assertEqual(parser_.parse_args(["resume", "claude"]).lane, "claude")
+        self.assertIsNone(parser_.parse_args(["pause"]).lane)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser_.parse_args(["pause", "nonsense"])
+
+    def test_a_pause_written_by_the_cli_survives_the_daemon(self):
+        """The CLI is what the user reaches for when Telegram is down.
+
+        A pause typed there while usage is high must not be converted to frozen
+        and then auto-resumed by the next tick.
+        """
+        self._capture(cli.cmd_pause, _Args(lane=lanes.CLAUDE))
+        doc = state.read_state()
+        self.assertEqual(
+            winddown.next_mode(doc["mode"][lanes.CLAUDE], 99.0, 0, CONFIG),
+            winddown.PAUSED)
+
+
+class TestCliLifecycle(_CliEnv):
+    """`dispatch up/down/logs --daemon`. tmux is injected, never really run."""
+
+    def _runner(self, alive, stdout=""):
+        calls = []
+
+        class Result:
+            def __init__(self, code, out=""):
+                self.returncode = code
+                self.stdout = out
+                self.stderr = ""
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["tmux", "has-session"]:
+                return Result(0 if alive else 1)
+            return Result(0, stdout)
+
+        return runner, calls
+
+    def _new_session(self, calls):
+        started = [c for c in calls if c[:2] == ["tmux", "new-session"]]
+        self.assertEqual(len(started), 1)
+        return started[0]
+
+    def test_session_alive_reads_has_session(self):
+        runner, _ = self._runner(alive=True)
+        self.assertTrue(cli.session_alive(runner))
+        runner, _ = self._runner(alive=False)
+        self.assertFalse(cli.session_alive(runner))
+
+    def test_up_starts_a_detached_session_when_dead(self):
+        runner, calls = self._runner(alive=False)
+        code, _, _ = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self.assertEqual(code, 0)
+        started = self._new_session(calls)
+        self.assertIn("-d", started)
+        self.assertIn(cli.TMUX_SESSION, started)
+
+    def test_up_is_idempotent_when_alive(self):
+        runner, calls = self._runner(alive=True)
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self.assertEqual([c for c in calls if c[:2] == ["tmux", "new-session"]], [])
+
+    def test_if_dead_is_silent_when_alive(self):
+        runner, _ = self._runner(alive=True)
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=True, runner=runner))
+        self.assertEqual((code, out, err), (0, "", ""))
+
+    def test_up_launches_the_script_not_an_importable_module(self):
+        """`python3 -m dispatch.cli run` imports cli.py and exits 0.
+
+        cli.py has no `__main__` guard, so the tmux session would die the
+        instant it started and the cron watchdog would relaunch it every five
+        minutes forever. What `up` runs has to be the script with the guard.
+        """
+        runner, calls = self._runner(alive=False)
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        command = self._new_session(calls)[-1]
+        self.assertNotIn("-m dispatch.cli", command)
+        argv = shlex.split(command)
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(os.path.basename(argv[1]), "dispatchd")
+        self.assertTrue(os.path.exists(argv[1]), argv[1])
+        with open(argv[1]) as fh:
+            self.assertIn('if __name__ == "__main__":', fh.read())
+
+    def test_up_runs_the_session_from_the_package_directory(self):
+        runner, calls = self._runner(alive=False)
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        started = self._new_session(calls)
+        cwd = started[started.index("-c") + 1]
+        self.assertTrue(os.path.isdir(os.path.join(cwd, "dispatch")), cwd)
+
+    def test_up_reports_a_failure_to_start(self):
+        def runner(argv, **kwargs):
+            class Result:
+                returncode = 1
+                stdout = ""
+                stderr = "no server running"
+            return Result()
+
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self.assertEqual(code, 1)
+        self.assertIn("no server running", err)
+        self.assertEqual(out, "")
+
+    def test_up_survives_tmux_not_being_installed(self):
+        """From cron a traceback is invisible; a non-zero exit is not."""
+        def runner(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "tmux")
+
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self.assertEqual(code, 1)
+        self.assertIn("tmux", err)
+
+    def test_down_kills_the_session(self):
+        runner, calls = self._runner(alive=True)
+        code, _, _ = self._capture(cli.cmd_down, _Args(runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn(["tmux", "kill-session", "-t", cli.TMUX_SESSION], calls)
+
+    def test_down_says_so_when_nothing_is_running(self):
+        runner, calls = self._runner(alive=False)
+        code, out, _ = self._capture(cli.cmd_down, _Args(runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn("not running", out)
+        self.assertEqual([c for c in calls if c[1] == "kill-session"], [])
+
+    def test_logs_daemon_reads_the_tmux_pane(self):
+        runner, calls = self._runner(alive=True, stdout="daemon says hello")
+        code, out, _ = self._capture(cli.cmd_logs, _Args(daemon=True, id=None,
+                                                         runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn("capture-pane", calls[-1])
+        self.assertIn(cli.TMUX_SESSION, calls[-1])
+        self.assertIn("daemon says hello", out)
+
+    def test_logs_daemon_says_so_when_the_session_is_gone(self):
+        def runner(argv, **kwargs):
+            class Result:
+                returncode = 1
+                stdout = ""
+                stderr = "can't find session: dispatchd"
+            return Result()
+
+        code, out, err = self._capture(cli.cmd_logs, _Args(daemon=True, id=None,
+                                                           runner=runner))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertIn(cli.TMUX_SESSION, err)
+
+    def test_logs_without_an_id_or_daemon_is_refused(self):
+        code, out, err = self._capture(cli.cmd_logs, _Args(daemon=False, id=None))
+        self.assertEqual(code, 2)
+        self.assertIn("--daemon", err)
+        self.assertEqual(out, "")
+
+    def test_logs_still_reads_a_task_log(self):
+        directory = config_mod.task_dir("t-0001")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "worker.log"), "w") as fh:
+            fh.write("step output")
+        code, out, _ = self._capture(cli.cmd_logs, _Args(daemon=False, id="1"))
+        self.assertEqual(code, 0)
+        self.assertIn("step output", out)
+
+    def test_the_parser_wires_up_down_and_logs_daemon(self):
+        parser_ = cli.build_parser()
+        self.assertIs(parser_.parse_args(["up"]).func, cli.cmd_up)
+        self.assertFalse(parser_.parse_args(["up"]).if_dead)
+        self.assertTrue(parser_.parse_args(["up", "--if-dead"]).if_dead)
+        self.assertIs(parser_.parse_args(["down"]).func, cli.cmd_down)
+        self.assertTrue(parser_.parse_args(["logs", "--daemon"]).daemon)
+        self.assertIsNone(parser_.parse_args(["logs", "--daemon"]).id)
+
+
+class TestCliSetup(_CliEnv):
+    """`setup` edits the user's settings.json, so it is held to that standard."""
+
+    ORIGINAL = ('{\n    "model": "opus",\n    "hooks": {"PreToolUse": [{"matcher": "Bash"}]},\n'
+                '    "enabledPlugins": {\n'
+                '        "telegram@claude-plugins-official": true,\n'
+                '        "superpowers@claude-plugins-official": true\n    }\n}\n')
+
+    def _settings(self, text=None):
+        path = os.path.join(self.tmp.name, "settings.json")
+        with open(path, "w") as fh:
+            fh.write(self.ORIGINAL if text is None else text)
+        return path
+
+    def test_disable_plugin_flips_the_boolean_and_backs_up(self):
+        path = self._settings()
+        backup = cli.disable_plugin(path)
+        self.assertTrue(os.path.exists(backup))
+        with open(path) as fh:
+            settings = json.load(fh)
+        self.assertFalse(settings["enabledPlugins"][cli.PLUGIN_KEY])
+        self.assertTrue(settings["enabledPlugins"]["superpowers@claude-plugins-official"])
+        self.assertEqual(settings["model"], "opus")
+
+    def test_disable_plugin_changes_exactly_one_value(self):
+        path = self._settings()
+        with open(path) as fh:
+            before = json.load(fh)
+        cli.disable_plugin(path)
+        with open(path) as fh:
+            after = json.load(fh)
+        before["enabledPlugins"][cli.PLUGIN_KEY] = False
+        self.assertEqual(after, before)
+
+    def test_the_backup_is_the_users_file_byte_for_byte(self):
+        """A reformatted backup is not a backup: restoring it would still
+        rewrite a file we were asked not to rewrite."""
+        path = self._settings()
+        backup = cli.disable_plugin(path)
+        with open(backup) as fh:
+            self.assertEqual(fh.read(), self.ORIGINAL)
+
+    def test_disable_plugin_is_a_noop_when_already_off(self):
+        path = self._settings(
+            '{"enabledPlugins": {"telegram@claude-plugins-official": false}}')
+        self.assertIsNone(cli.disable_plugin(path))
+        self.assertFalse(os.path.exists(path + ".bak"))
+
+    def test_disable_plugin_leaves_unrelated_keys_intact(self):
+        path = self._settings()
+        cli.disable_plugin(path)
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["hooks"],
+                             {"PreToolUse": [{"matcher": "Bash"}]})
+
+    def test_disable_plugin_is_a_noop_on_an_unreadable_file(self):
+        self.assertIsNone(cli.disable_plugin(
+            os.path.join(self.tmp.name, "absent.json")))
+        path = self._settings("not json at all")
+        self.assertIsNone(cli.disable_plugin(path))
+        self.assertFalse(os.path.exists(path + ".bak"))
+
+    def test_setup_disables_the_plugin_and_writes_config(self):
+        path = self._settings()
+        code, out, _ = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=False, repo=None, chat=["7256243815"]))
+        self.assertEqual(code, 0)
+        self.assertIn("disabled %s" % cli.PLUGIN_KEY, out)
+        self.assertIn(path + ".bak", out)
+        self.assertIn("dispatch up", out)
+        with open(path) as fh:
+            self.assertFalse(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
+        self.assertEqual(config_mod.load()["chat_allowlist"], ["7256243815"])
+
+    def test_setup_keeps_the_plugin_when_told_to_and_warns(self):
+        path = self._settings()
+        code, _, err = self._capture(cli.cmd_setup, _Args(
+            settings=path, keep_plugin=True, repo=None, chat=None))
+        self.assertEqual(code, 0)
+        self.assertIn("409", err)
+        with open(path) as fh:
+            self.assertTrue(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
+        self.assertFalse(os.path.exists(path + ".bak"))
+
+    def test_setup_no_longer_refuses(self):
+        """The 2026-08-18 refusal protected a peer interface. That interface is
+        the thing being replaced now, and leaving it on guarantees the 409."""
+        parser_ = cli.build_parser()
+        self.assertTrue(parser_.parse_args(["setup", "--keep-plugin"]).keep_plugin)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser_.parse_args(["setup", "--force"])
 
 
 if __name__ == "__main__":

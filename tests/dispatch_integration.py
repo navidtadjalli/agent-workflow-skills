@@ -9,13 +9,16 @@ git are real. Each stub honours its own contract: `claude` takes the prompt on
 stdin and emits a fenced status block, `codex` writes its status JSON where `-o`
 points and announces its thread id on the event stream.
 """
+import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLI = os.path.join(ROOT, "skills", "dispatch", "scripts", "dispatch")
 sys.path.insert(0, os.path.join(ROOT, "skills", "dispatch"))
 
 from dispatch import chat as chat_mod  # noqa: E402
@@ -85,6 +88,11 @@ class DispatchIntegration(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "test@example.invalid",
             # Never let a test read the real channel token.
             "DISPATCH_TOKEN_ENV": os.path.join(root, "absent.env"),
+            # The daemon is handed its readings; a CLI subprocess is not, so
+            # the roots themselves point here rather than at the real
+            # ~/.claude/projects and ~/.codex/sessions.
+            "DISPATCH_TRANSCRIPTS": os.path.join(root, "transcripts"),
+            "DISPATCH_CODEX_SESSIONS": os.path.join(root, "codex-sessions"),
         })
 
         for repo in (self.repo, self.repo2):
@@ -348,28 +356,67 @@ class DispatchIntegration(unittest.TestCase):
 
     def test_cli_status_and_queue_run_against_the_same_state(self):
         self._enqueue()
-        cli = os.path.join(ROOT, "skills", "dispatch", "scripts", "dispatch")
-        out = subprocess.run([sys.executable, cli, "queue"], capture_output=True,
+        out = subprocess.run([sys.executable, CLI, "queue"], capture_output=True,
                              text=True, env=os.environ)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("t-0001", out.stdout)
 
-        out = subprocess.run([sys.executable, cli, "status"], capture_output=True,
+        out = subprocess.run([sys.executable, CLI, "status"], capture_output=True,
                              text=True, env=os.environ)
-        self.assertIn("mode: running", out.stdout)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # Both lanes, because the CLI is what the user reaches for when the
+        # chat surface is down, and half the truth is worst-case there.
+        self.assertRegex(out.stdout, r"claude\s+running")
+        self.assertRegex(out.stdout, r"codex\s+running")
+        self.assertIn("queued 1", out.stdout)
 
-    def test_setup_refuses_while_the_chat_plugin_owns_the_bot(self):
+    def test_the_cli_works_through_a_symlink_on_path(self):
+        """Task 11 puts `dispatch` on PATH as a symlink.
+
+        `abspath` does not resolve one, so the launcher would insert the
+        symlink's own directory into `sys.path` and fail to import the package.
+        """
+        link = os.path.join(self.tmp.name, "bin", "dispatch")
+        os.symlink(CLI, link)
+        out = subprocess.run([link, "status"], capture_output=True, text=True,
+                             env=os.environ)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertRegex(out.stdout, r"claude\s+running")
+
+    def test_the_tmux_launch_command_really_starts_the_daemon(self):
+        """What `dispatch up` hands tmux has to be a program that keeps running.
+
+        `python3 -m dispatch.cli run` imports cli.py and exits 0 -- there is no
+        `__main__` guard -- so the session would die on launch and the cron
+        watchdog would relaunch it every five minutes forever. Zero ticks, so
+        nothing is polled and no request is spent; the daemon's own directories
+        are the evidence that it was actually constructed.
+        """
+        from dispatch import cli as cli_mod
+
+        home = os.path.join(self.tmp.name, "up-home")
+        env = dict(os.environ, DISPATCH_HOME=home)
+        command, cwd = cli_mod._daemon_argv()
+        out = subprocess.run(shlex.split(command) + ["--ticks", "0"], cwd=cwd,
+                             capture_output=True, text=True, env=env,
+                             stdin=subprocess.DEVNULL)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(home, "locks")), out.stdout)
+
+    def test_setup_disables_the_conflicting_chat_plugin(self):
         settings = os.path.join(self.tmp.name, "settings.json")
         with open(settings, "w") as fh:
             fh.write('{"enabledPlugins": {"telegram@claude-plugins-official": true}}')
-        cli = os.path.join(ROOT, "skills", "dispatch", "scripts", "dispatch")
         out = subprocess.run(
-            [sys.executable, cli, "setup", "--settings", settings,
+            [sys.executable, CLI, "setup", "--settings", settings,
              "--repo", "demo=" + self.repo],
             capture_output=True, text=True, env=os.environ)
-        self.assertEqual(out.returncode, 3)
-        self.assertIn("refusing", out.stderr)
-        self.assertFalse(os.path.exists(config_mod.config_path()))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        with open(settings) as fh:
+            self.assertFalse(json.load(fh)["enabledPlugins"][
+                "telegram@claude-plugins-official"])
+        self.assertTrue(os.path.exists(settings + ".bak"))
+        self.assertTrue(os.path.exists(config_mod.config_path()))
 
 
 if __name__ == "__main__":

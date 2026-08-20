@@ -3,7 +3,9 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# realpath, not abspath: this lands on PATH as a symlink, and abspath would
+# insert the symlink's own directory instead of the package's.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from dispatch.cli import main  # noqa: E402
 

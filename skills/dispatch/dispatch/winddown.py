@@ -1,6 +1,6 @@
 """Wind-down: stop cleanly before the plan limit stops us badly.
 
-Three modes, and the transitions between them are the whole point:
+Four modes, and the transitions between them are the whole point:
 
 ``running``        dispatching normally.
 ``winding-down``   past the soft limit. No new dispatch and no new step, but an
@@ -8,6 +8,8 @@ Three modes, and the transitions between them are the whole point:
                    would leave a dirty tree and waste what it already spent.
 ``frozen``         nothing running. A resume is armed for just after the plan
                    window resets.
+``paused``         a human said stop. Usage never enters or leaves this mode --
+                   only ``resume`` does.
 
 The hard limit is the exception: at that point a straggler is terminated
 (SIGTERM, grace, then SIGKILL) and whatever it produced is salvage-committed.
@@ -16,12 +18,21 @@ The hard limit is the exception: at that point a straggler is terminated
 RUNNING = "running"
 WINDING_DOWN = "winding-down"
 FROZEN = "frozen"
+PAUSED = "paused"
 
 RESUME_DELAY = 60  # seconds after the reset before resuming, for clock skew
 
 
 def next_mode(mode, session_pct, running, config, stale=False):
     """Pure transition function. Returns the mode implied by the situation."""
+    if mode == PAUSED:
+        # A human outranks a reading. Left to the rules below, a lane paused
+        # above the soft limit would become `frozen`, and `frozen` hands itself
+        # back to the scheduler as soon as a fresh reading confirms the reset --
+        # so an explicit pause would quietly start spending again. Only `resume`
+        # leaves this mode.
+        return PAUSED
+
     if session_pct is None or stale:
         # Never escalate on a guess; hold the current mode and let the caller
         # poll. Only an explicit pause or a real reading moves us.

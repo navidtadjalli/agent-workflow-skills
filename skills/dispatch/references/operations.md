@@ -2,14 +2,17 @@
 
 ## Setup
 
-`dispatch setup` writes config and prints the systemd unit. It deliberately does
-not install or start anything, and it refuses outright while an in-session chat
-plugin owns the same bot -- two consumers polling one bot get 409s, and the
-in-session one is probably the socket you are talking to right now. It will
-never edit your settings for you.
+`dispatch setup` writes config. It starts nothing -- `dispatch up` does that --
+but it does make one edit outside its own state: it turns off the in-session
+chat plugin that owns the same bot, because two consumers polling one bot get
+409s. Your `settings.json` is copied to `settings.json.bak` first and exactly
+one boolean changes. Pass `--keep-plugin` to be warned instead of edited.
 
 ```bash
 dispatch setup --repo qpay=~/Projects/qpay-backend --chat <chat-id>
+dispatch up          # start the daemon in tmux; idempotent
+dispatch down        # stop it
+dispatch logs --daemon   # what the daemon is saying right now
 ```
 
 State lives under `~/.claude/dispatch/` (override with `DISPATCH_HOME`):

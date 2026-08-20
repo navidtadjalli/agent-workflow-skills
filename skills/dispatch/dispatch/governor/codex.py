@@ -26,6 +26,8 @@ import glob
 import json
 import os
 
+from .. import config
+
 SESSION_WINDOW_MINUTES = 300
 WEEK_WINDOW_MINUTES = 10080
 
@@ -40,7 +42,7 @@ TAIL_BYTES = 262_144
 
 
 def default_root():
-    return os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+    return config.codex_sessions_root()
 
 
 def _mtime(path):

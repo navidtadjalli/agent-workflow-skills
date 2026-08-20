@@ -17,6 +17,8 @@ import re
 import subprocess
 import time
 
+from . import config
+
 SESSION_WINDOW = 5 * 3600
 WEEK_WINDOW = 7 * 24 * 3600
 
@@ -159,7 +161,7 @@ def transcript_tokens(now=None, root=None, window=SESSION_WINDOW):
     earlier messages into a new file.
     """
     now = time.time() if now is None else now
-    root = root or os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    root = root or config.transcripts_root()
     total = 0
     seen = set()
     for path in glob.glob(os.path.join(root, "*", "*.jsonl")):

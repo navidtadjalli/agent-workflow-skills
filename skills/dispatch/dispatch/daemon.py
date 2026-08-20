@@ -46,6 +46,27 @@ class InlineExecutor:
         return None
 
 
+def set_mode(verb, lane):
+    """Pause or resume one lane, or both when none is named. Returns the reply.
+
+    Module level because both surfaces call it: the chat verb through
+    ``Daemon.set_mode`` and ``dispatch pause`` through the CLI. Two copies of
+    "what does pause mean" would eventually disagree, and the one that drifted
+    would be the one the user reached for when the other was down.
+    """
+    targets = [lane] if lane else list(lanes.ALL)
+    value = winddown.PAUSED if verb == "pause" else winddown.RUNNING
+    with state.mutate_state() as doc:
+        for target in targets:
+            doc["mode"][target] = value
+            if verb == "resume":
+                doc["armed_resume_at"][target] = None
+    if verb == "pause":
+        return "paused %s · in-flight steps finish, nothing new starts" % (
+            ", ".join(targets))
+    return "resumed %s" % ", ".join(targets)
+
+
 class Daemon:
     def __init__(self, config=None, clock=None, poll_usage=None, count_tokens=None,
                  chat=None, run_step=None, executor=None, freeform=None,
@@ -329,18 +350,8 @@ class Daemon:
         return reply or "nothing to do · send `help` for what I understand"
 
     def set_mode(self, verb, lane):
-        """Pause or resume one lane, or both when none is named."""
-        targets = [lane] if lane else list(lanes.ALL)
-        value = "paused" if verb == "pause" else winddown.RUNNING
-        with state.mutate_state() as doc:
-            for target in targets:
-                doc["mode"][target] = value
-                if verb == "resume":
-                    doc["armed_resume_at"][target] = None
-        if verb == "pause":
-            return "paused %s · in-flight steps finish, nothing new starts" % (
-                ", ".join(targets))
-        return "resumed %s" % ", ".join(targets)
+        """The chat verb. Shares its body with `dispatch pause` / `resume`."""
+        return set_mode(verb, lane)
 
     def enqueue(self, repo, prompt, isolation, mode, reading, agent="claude"):
         found = self.found_repos()
@@ -453,24 +464,14 @@ class Daemon:
 
         claude = readings[lanes.CLAUDE]
         codex = readings[lanes.CODEX]
-        lines.append("CLAUDE  %s" % self._pct_line(claude))
+        lines.append("CLAUDE  %s" % governor.pct_line(claude))
         polled_at = snapshot.get("polled_at")
         if polled_at:
             lines.append("        last real poll %dm ago" % ((now - polled_at) // 60))
-        lines.append("CODEX   %s" % self._pct_line(codex))
+        lines.append("CODEX   %s" % governor.pct_line(codex))
         lines.append("")
         lines.append(self.volume_block(now))
         return "\n".join(lines)
-
-    @staticmethod
-    def _pct_line(reading):
-        if reading.get("session_pct") is None:
-            return "unknown"
-        parts = ["session %.0f%%" % reading["session_pct"]]
-        if reading.get("week_pct") is not None:
-            parts.append("week %.0f%%" % reading["week_pct"])
-        parts.append(reading.get("source") or "unknown")
-        return " · ".join(parts)
 
     def status_line(self, modes, snapshot, readings, now, tokens):
         queue = state.read_queue()
@@ -479,9 +480,9 @@ class Daemon:
             counts[task["state"]] = counts.get(task["state"], 0) + 1
         lines = [
             "claude  %s · %s" % (modes[lanes.CLAUDE],
-                                 self._pct_line(readings[lanes.CLAUDE])),
+                                 governor.pct_line(readings[lanes.CLAUDE])),
             "codex   %s · %s" % (modes[lanes.CODEX],
-                                 self._pct_line(readings[lanes.CODEX])),
+                                 governor.pct_line(readings[lanes.CODEX])),
             "queue   %s" % (" ".join("%s %d" % kv for kv in sorted(counts.items()))
                             or "empty"),
         ]
@@ -591,9 +592,15 @@ class Daemon:
                 if lane == lanes.CLAUDE:
                     doc["governor"] = governor.note_limit_error(
                         doc.get("governor") or snapshot, result["limit_reset_at"])
-                doc["mode"][lane] = winddown.FROZEN
-                doc["armed_resume_at"][lane] = winddown.resume_at(
-                    result["limit_reset_at"])
+                # A limit error is still a usage fact, and usage may not
+                # overwrite a pause: a lane frozen here would arm a resume and
+                # let itself go again at the reset, discarding what the user
+                # said. The override recorded above survives, so a lane resumed
+                # before the window rolls freezes on the next tick anyway.
+                if doc["mode"][lane] != winddown.PAUSED:
+                    doc["mode"][lane] = winddown.FROZEN
+                    doc["armed_resume_at"][lane] = winddown.resume_at(
+                        result["limit_reset_at"])
 
         # After the freeze above and after intake, so a step that finished into
         # a lane the user just paused is paused rather than requeued.

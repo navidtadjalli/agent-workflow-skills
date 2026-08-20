@@ -70,6 +70,28 @@ def token_env_path():
     )
 
 
+def transcripts_root():
+    """Where Claude writes session transcripts, which the governor counts.
+
+    The daemon is handed a token counter and can be pointed anywhere; the CLI
+    computes the same number itself and had no such seam, so `dispatch status`
+    read whichever home directory it happened to run under -- including a test
+    runner's. Overridable for the same reason ``DISPATCH_TOKEN_ENV`` is.
+    """
+    return os.environ.get(
+        "DISPATCH_TRANSCRIPTS",
+        os.path.join(os.path.expanduser("~"), ".claude", "projects"),
+    )
+
+
+def codex_sessions_root():
+    """Where codex writes the session logs its plan limits come from."""
+    return os.environ.get(
+        "DISPATCH_CODEX_SESSIONS",
+        os.path.join(os.path.expanduser("~"), ".codex", "sessions"),
+    )
+
+
 def ensure_dirs():
     for sub in ("", "locks", "tasks"):
         os.makedirs(path(sub) if sub else home(), exist_ok=True)

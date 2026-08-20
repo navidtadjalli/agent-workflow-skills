@@ -12,7 +12,7 @@ governing, or scheduling in a session -- drive the CLI.
 ## Know what is running before anything else
 
 ```bash
-dispatch status      # mode, usage, queue counts
+dispatch status      # both lanes: mode, usage, queue counts
 dispatch queue       # live tasks
 dispatch usage       # cached estimate; --poll spends a request for the truth
 ```
@@ -24,7 +24,7 @@ dispatch usage       # cached estimate; --poll spends a request for the truth
 | `running` | Dispatching normally | Queue depth and what is in flight |
 | `winding-down` | Past the soft limit; in-flight step finishes, nothing new starts | What will still land, what waits |
 | `frozen` | Nothing running; resume armed for after the window resets | When it resumes |
-| `paused` | A human paused it | That it needs an explicit `dispatch resume` |
+| `paused` | A human paused it | That it needs an explicit `dispatch resume`; usage never lifts it |
 
 Never say work "failed" when the mode is `winding-down` or `frozen`. It is
 deferred, and its branch and handoff note are intact.
@@ -61,6 +61,7 @@ queue; do it in session instead.
 
 ```bash
 dispatch logs t-0007       # raw worker output
+dispatch logs --daemon     # what the daemon itself is saying
 dispatch cancel t-0007     # running tasks finish their current step first
 ```
 

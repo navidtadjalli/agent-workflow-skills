@@ -7,18 +7,20 @@ daemon is down simply queues, and the task starts when the daemon comes back.
 import argparse
 import json
 import os
+import shlex
+import subprocess
 import sys
+import time
 
 from . import config as config_mod
 from . import daemon as daemon_mod
-from . import governor, lanes, state, usage, winddown
+from . import governor, lanes, state, usage
 
 PLUGIN_KEY = "telegram@claude-plugins-official"
+TMUX_SESSION = "dispatchd"
 
 
 def _snapshot(now=None):
-    import time
-
     now = now or time.time()
     doc = state.read_state()
     snapshot = doc.get("governor") or governor.blank()
@@ -27,20 +29,27 @@ def _snapshot(now=None):
 
 
 def cmd_status(args):
+    """Both lanes, always.
+
+    This is the surface the user is left with when the chat one is down, which
+    is exactly when a report about half the system is worst-case.
+    """
     doc, snapshot, tokens, now = _snapshot()
+    readings = {lanes.CLAUDE: governor.estimate(snapshot, now, tokens),
+                lanes.CODEX: governor.codex.estimate(now)}
     queue = state.read_queue()
     counts = {}
     for task in queue["tasks"]:
         counts[task["state"]] = counts.get(task["state"], 0) + 1
-    print("mode: %s" % doc["mode"][lanes.CLAUDE])
-    print("usage: %s" % governor.summary(snapshot, now, tokens))
-    if doc["armed_resume_at"][lanes.CLAUDE]:
-        import time
-
-        print("resume armed: %s" % time.strftime(
-            "%Y-%m-%d %H:%M", time.localtime(doc["armed_resume_at"][lanes.CLAUDE])))
-    print("queue: %s" % (" ".join("%s=%d" % kv for kv in sorted(counts.items()))
-                         or "empty"))
+    for lane in lanes.ALL:
+        print("%-7s %s · %s" % (lane, doc["mode"][lane],
+                                governor.pct_line(readings[lane])))
+        armed = doc["armed_resume_at"][lane]
+        if armed:
+            print("        %s resume armed %s" % (
+                lane, time.strftime("%Y-%m-%d %H:%M", time.localtime(armed))))
+    print("queue   %s" % (" ".join("%s %d" % kv for kv in sorted(counts.items()))
+                          or "empty"))
     return 0
 
 
@@ -93,23 +102,33 @@ def cmd_cancel(args):
 
 
 def cmd_pause(args):
-    with state.mutate_state() as doc:
-        doc["mode"] = {lane: "paused" for lane in lanes.ALL}
-    print("paused")
+    """`dispatch pause [lane]`, meaning exactly what `pause [lane]` does in chat."""
+    print(daemon_mod.set_mode("pause", getattr(args, "lane", None)))
     return 0
 
 
 def cmd_resume(args):
-    with state.mutate_state() as doc:
-        doc["mode"] = {lane: winddown.RUNNING for lane in lanes.ALL}
-        doc["armed_resume_at"] = {lane: None for lane in lanes.ALL}
-    print("running")
+    print(daemon_mod.set_mode("resume", getattr(args, "lane", None)))
     return 0
 
 
 def cmd_logs(args):
     from . import parser
 
+    if getattr(args, "daemon", False):
+        result = _tmux(["capture-pane", "-pt", TMUX_SESSION],
+                       getattr(args, "runner", None))
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            print("no output from tmux session '%s'%s"
+                  % (TMUX_SESSION, " · " + detail if detail else ""),
+                  file=sys.stderr)
+            return 2
+        sys.stdout.write(result.stdout)
+        return 0
+    if not args.id:
+        print("logs needs a task id, or --daemon", file=sys.stderr)
+        return 2
     task_id = parser.normalize_id(args.id)
     path = os.path.join(config_mod.task_dir(task_id), "worker.log")
     try:
@@ -141,6 +160,75 @@ def cmd_run(args):
     return 0
 
 
+class _Unrunnable:
+    """A command that could not be started, shaped like a CompletedProcess.
+
+    From cron a traceback goes nowhere; a non-zero return does not.
+    """
+
+    returncode = 127
+    stdout = ""
+
+    def __init__(self, message):
+        self.stderr = message
+
+
+def _tmux(argv, runner=None):
+    runner = runner or subprocess.run
+    try:
+        return runner(["tmux"] + list(argv), capture_output=True, text=True)
+    except OSError as exc:
+        return _Unrunnable("tmux: %s" % exc)
+
+
+def session_alive(runner=None):
+    return _tmux(["has-session", "-t", TMUX_SESSION], runner).returncode == 0
+
+
+def _daemon_argv():
+    """The command the tmux session runs, and the directory it runs it in.
+
+    Absolute, because cron has no PATH. Through ``realpath``, because Task 11
+    puts this CLI on PATH as a symlink and the daemon must still be found next
+    to the package rather than next to the link.
+
+    It is the ``dispatchd`` script, not ``python3 -m dispatch.cli run``: this
+    module has no ``__main__`` guard, so ``-m`` would import it and exit 0 --
+    tmux would report a successful launch of a session that was already gone,
+    and the watchdog would do it again five minutes later, forever.
+    """
+    package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    script = os.path.join(package, "scripts", "dispatchd")
+    return "%s %s" % (shlex.quote(sys.executable), shlex.quote(script)), package
+
+
+def cmd_up(args):
+    """Start the daemon in tmux. Idempotent; --if-dead makes it silent."""
+    runner = getattr(args, "runner", None)
+    if session_alive(runner):
+        if not getattr(args, "if_dead", False):
+            print("dispatchd already running in tmux session '%s'" % TMUX_SESSION)
+        return 0
+    command, cwd = _daemon_argv()
+    result = _tmux(["new-session", "-d", "-s", TMUX_SESSION, "-c", cwd, command],
+                   runner)
+    if result.returncode != 0:
+        print("failed to start: %s" % (result.stderr or "").strip(), file=sys.stderr)
+        return 1
+    print("started dispatchd in tmux session '%s'" % TMUX_SESSION)
+    return 0
+
+
+def cmd_down(args):
+    runner = getattr(args, "runner", None)
+    if not session_alive(runner):
+        print("dispatchd is not running")
+        return 0
+    _tmux(["kill-session", "-t", TMUX_SESSION], runner)
+    print("stopped dispatchd")
+    return 0
+
+
 def _plugin_enabled(settings_path):
     try:
         with open(settings_path) as fh:
@@ -153,23 +241,60 @@ def _plugin_enabled(settings_path):
     return PLUGIN_KEY in enabled
 
 
-def cmd_setup(args):
-    """Write config and print the unit. Never starts anything, never edits settings.
+def disable_plugin(settings_path):
+    """Turn the conflicting chat plugin off. Returns the backup path, or None.
 
-    The refusal below is not caution for its own sake: two processes polling the
-    same bot get 409s from the chat API, and the in-session plugin is very likely
-    the socket the user is talking to us on right now.
+    Exactly one value changes, and the file is copied verbatim first. The copy
+    is the original bytes rather than a re-serialization, because the point of a
+    backup is to put back exactly what was there -- a reformatted one would
+    still rewrite the file the user asked us not to rewrite. For the same reason
+    the edit keeps the original key order instead of sorting.
+    """
+    try:
+        with open(settings_path) as fh:
+            original = fh.read()
+        settings = json.loads(original)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(settings, dict):
+        return None
+    enabled = settings.get("enabledPlugins")
+    if not isinstance(enabled, dict) or not enabled.get(PLUGIN_KEY):
+        return None
+    backup = settings_path + ".bak"
+    with open(backup, "w") as fh:
+        fh.write(original)
+    enabled[PLUGIN_KEY] = False
+    with open(settings_path, "w") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    return backup
+
+
+def cmd_setup(args):
+    """Write config, and take the bot away from the plugin. Starts nothing.
+
+    The 2026-08-18 design refused to touch ``settings.json`` because the plugin
+    was a peer interface worth protecting. It is the thing being replaced now,
+    and leaving it enabled guarantees the 409 the refusal was avoiding: one
+    token admits exactly one consumer.
     """
     config_mod.ensure_dirs()
     settings_path = args.settings or os.path.join(
         os.path.expanduser("~"), ".claude", "settings.json")
-    if _plugin_enabled(settings_path) and not args.force:
-        print("refusing: %s is enabled in %s" % (PLUGIN_KEY, settings_path), file=sys.stderr)
-        print("Two consumers of the same bot conflict. Disable that plugin yourself,",
-              file=sys.stderr)
-        print("then re-run `dispatch setup`. This command will not edit your settings.",
-              file=sys.stderr)
-        return 3
+    if _plugin_enabled(settings_path):
+        if args.keep_plugin:
+            print("warning: %s is still enabled; two consumers of one bot get 409s"
+                  % PLUGIN_KEY, file=sys.stderr)
+        else:
+            backup = disable_plugin(settings_path)
+            if backup:
+                print("disabled %s in %s (backup: %s)"
+                      % (PLUGIN_KEY, settings_path, backup))
+            else:
+                print("could not disable %s in %s; turn it off by hand before "
+                      "starting the daemon" % (PLUGIN_KEY, settings_path),
+                      file=sys.stderr)
 
     cfg = config_mod.load()
     if args.repo:
@@ -190,15 +315,7 @@ def cmd_setup(args):
         print("warning: no bot token at %s; chat intake stays offline"
               % config_mod.token_env_path(), file=sys.stderr)
 
-    unit = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "systemd", "dispatchd.service.template")
-    print("unit template: %s" % unit)
-    print("install it yourself with:")
-    print("  mkdir -p ~/.config/systemd/user")
-    print("  sed 's|@EXEC@|%s|' %s > ~/.config/systemd/user/dispatchd.service"
-          % (os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "scripts", "dispatchd"), unit))
-    print("  systemctl --user daemon-reload && systemctl --user enable --now dispatchd")
+    print("start it with: dispatch up")
     return 0
 
 
@@ -225,11 +342,16 @@ def build_parser():
     cancel.add_argument("id")
     cancel.set_defaults(func=cmd_cancel)
 
-    subs.add_parser("pause").set_defaults(func=cmd_pause)
-    subs.add_parser("resume").set_defaults(func=cmd_resume)
+    for verb, func in (("pause", cmd_pause), ("resume", cmd_resume)):
+        lane = subs.add_parser(verb, help="%s one lane, or both" % verb)
+        lane.add_argument("lane", nargs="?", choices=list(lanes.ALL),
+                          help="which lane; omit for both")
+        lane.set_defaults(func=func)
 
     logs = subs.add_parser("logs")
-    logs.add_argument("id")
+    logs.add_argument("id", nargs="?")
+    logs.add_argument("--daemon", action="store_true",
+                      help="show the daemon's own output instead of a task's")
     logs.set_defaults(func=cmd_logs)
 
     usage_cmd = subs.add_parser("usage")
@@ -242,12 +364,19 @@ def build_parser():
     run.add_argument("--ticks", type=int, default=None)
     run.set_defaults(func=cmd_run)
 
+    up = subs.add_parser("up", help="start the daemon in tmux (idempotent)")
+    up.add_argument("--if-dead", action="store_true",
+                    help="say nothing when it is already running")
+    up.set_defaults(func=cmd_up)
+
+    subs.add_parser("down", help="stop the tmux session").set_defaults(func=cmd_down)
+
     setup = subs.add_parser("setup")
     setup.add_argument("--repo", action="append", metavar="ALIAS=PATH")
     setup.add_argument("--chat", action="append", metavar="CHAT_ID")
-    setup.add_argument("--settings", help="settings file to check for a conflicting plugin")
-    setup.add_argument("--force", action="store_true",
-                       help="write config even if a conflicting chat plugin is enabled")
+    setup.add_argument("--settings", help="settings file holding the plugin switch")
+    setup.add_argument("--keep-plugin", action="store_true",
+                       help="do not disable the conflicting chat plugin")
     setup.set_defaults(func=cmd_setup)
 
     return root
