@@ -8,13 +8,15 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "skills", "dispatch"))
 
 from dispatch import config as config_mod  # noqa: E402
-from dispatch import backends, governor, lanes, parser, repos, scheduler, state, usage, winddown, worker  # noqa: E402
+from dispatch import backends, governor, lanes, parser, repos, scheduler, state, usage, volume, winddown, worker  # noqa: E402
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
@@ -1030,6 +1032,100 @@ class TestReadVerbs(unittest.TestCase):
 
     def test_pause_with_a_nonsense_lane_is_not_a_pause(self):
         self.assertNotEqual(parser.parse("pause everything")["kind"], "pause")
+
+
+class TestVolume(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 1_800_000_000.0
+
+    def _claude_log(self, project, records):
+        directory = os.path.join(self.tmp.name, "claude", project)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "s.jsonl")
+        with open(path, "w") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+        os.utime(path, (self.now, self.now))
+        return path
+
+    def _turn(self, offset, message_id, total):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S",
+                              time.localtime(self.now - offset))
+        return {"timestamp": stamp, "message": {
+            "id": message_id, "model": "claude-opus-5",
+            "usage": {"input_tokens": total - 10, "output_tokens": 10,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0}}}
+
+    def test_clock_is_injected_not_global(self):
+        """The port's whole point: NOW was a module constant."""
+        self._claude_log("-home-navid-Projects-qpay", [self._turn(60, "m1", 1000)])
+        win, _, _, _ = volume.claude_usage(
+            self.now, root=os.path.join(self.tmp.name, "claude"))
+        self.assertEqual(win["5h"], 1000)
+        # Same tree, a clock two days later: nothing is in the 5h window.
+        win, _, _, _ = volume.claude_usage(
+            self.now + 2 * 86400, root=os.path.join(self.tmp.name, "claude"))
+        self.assertEqual(win["5h"], 0)
+
+    def test_duplicate_message_ids_count_once(self):
+        """A resumed session replays earlier messages into a new file."""
+        self._claude_log("-home-navid-Projects-qpay",
+                         [self._turn(60, "m1", 1000), self._turn(50, "m1", 1000)])
+        win, _, _, _ = volume.claude_usage(
+            self.now, root=os.path.join(self.tmp.name, "claude"))
+        self.assertEqual(win["5h"], 1000)
+
+    def test_project_attribution(self):
+        self._claude_log("-home-navid-Projects-qpay", [self._turn(60, "m1", 500)])
+        self._claude_log("-home-navid-Projects-poook", [self._turn(60, "m2", 300)])
+        _, proj, _, _ = volume.claude_usage(
+            self.now, root=os.path.join(self.tmp.name, "claude"))
+        self.assertEqual(proj["qpay"], 500)
+        self.assertEqual(proj["poook"], 300)
+
+    def test_codex_takes_the_newest_total_per_session(self):
+        directory = os.path.join(self.tmp.name, "codex", "2026", "08", "20")
+        os.makedirs(directory)
+        path = os.path.join(directory, "r.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"payload": {"cwd": "/home/navid/Projects/qpay"}}) + "\n")
+            fh.write(json.dumps({"payload": {"info": {"total_token_usage": {
+                "total_tokens": 100, "output_tokens": 10}}}}) + "\n")
+            fh.write(json.dumps({"payload": {"info": {"total_token_usage": {
+                "total_tokens": 900, "output_tokens": 90}}}}) + "\n")
+        os.utime(path, (self.now, self.now))
+        totals, _ = volume.codex_usage(
+            self.now, root=os.path.join(self.tmp.name, "codex"))
+        self.assertEqual(totals["all"], 900)
+
+    def test_human_scales(self):
+        self.assertEqual(volume.human(1_500_000), "1.5M")
+        self.assertEqual(volume.human(2_000), "2.0K")
+        self.assertEqual(volume.human(42), "42")
+
+    def test_render_never_spends_a_request(self):
+        """`usage` must be free; only `usage poll` may spend a request.
+
+        Asserted behaviourally: the paid path is a subprocess, so make any
+        subprocess fatal and prove render() completes without one.
+        """
+        empty = os.path.join(self.tmp.name, "none")
+        boom = AssertionError("render() spawned a subprocess")
+        with mock.patch("subprocess.run", side_effect=boom), \
+                mock.patch("subprocess.Popen", side_effect=boom):
+            text = volume.render(self.now, claude_root=empty, codex_root=empty)
+        self.assertIn("CLAUDE", text)
+        self.assertFalse(hasattr(volume, "plan_limits"),
+                         "plan_limits must not survive the port")
+
+    def test_render_on_an_empty_tree_does_not_raise(self):
+        text = volume.render(self.now,
+                             claude_root=os.path.join(self.tmp.name, "none"),
+                             codex_root=os.path.join(self.tmp.name, "none"))
+        self.assertIn("CLAUDE", text)
 
 
 if __name__ == "__main__":

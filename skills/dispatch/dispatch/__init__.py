@@ -12,6 +12,7 @@ __all__ = [
     "lanes",
     "repos",
     "usage",
+    "volume",
     "governor",
     "scheduler",
     "winddown",
