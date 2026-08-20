@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -1713,6 +1715,18 @@ class _Args:
         self.__dict__.update(kwargs)
 
 
+def _only_writes_fail(path):
+    """Wrap `open` so writing one specific path raises, reads still work."""
+    real = open
+
+    def guarded(file, mode="r", *args, **kwargs):
+        if file == path and "w" in mode:
+            raise OSError("read-only file system")
+        return real(file, mode, *args, **kwargs)
+
+    return guarded
+
+
 class _CliEnv(unittest.TestCase):
     """Base for CLI tests: every root the CLI reads lives in a temp tree.
 
@@ -1727,19 +1741,36 @@ class _CliEnv(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.transcripts = os.path.join(self.tmp.name, "transcripts")
         self.codex_logs = os.path.join(self.tmp.name, "codex-sessions")
+        self.bin = self._write_agents(os.path.join(self.tmp.name, "bin"),
+                                      "claude", "codex")
         patcher = mock.patch.dict(os.environ, {
             "DISPATCH_HOME": os.path.join(self.tmp.name, "home"),
             "DISPATCH_TRANSCRIPTS": self.transcripts,
             "DISPATCH_CODEX_SESSIONS": self.codex_logs,
             "DISPATCH_TOKEN_ENV": os.path.join(self.tmp.name, "absent.env"),
+            # `~` and PATH too: `dispatch up` probes both for the agents, and
+            # a test may not so much as stat the developer's home directory.
+            "HOME": self.tmp.name,
+            "PATH": self.bin,
         })
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _capture(self, func, args):
+    @staticmethod
+    def _write_agents(directory, *names):
+        """Executables named like the agents, so nothing probes a real one."""
+        os.makedirs(directory, exist_ok=True)
+        for name in names:
+            target = os.path.join(directory, name)
+            with open(target, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(target, 0o755)
+        return directory
+
+    def _capture(self, func, *args):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = func(args)
+            code = func(*args)
         return code, out.getvalue(), err.getvalue()
 
     def _write_codex_limits(self, session_pct, week_pct, now):
@@ -1890,6 +1921,19 @@ class TestCliLifecycle(_CliEnv):
         self.assertEqual(len(started), 1)
         return started[0]
 
+    def _launch_argv(self, calls):
+        """The launched program, past the environment assignments in front."""
+        argv = shlex.split(self._new_session(calls)[-1])
+        while argv and re.match(r"^[A-Z_][A-Z0-9_]*=", argv[0]):
+            argv.pop(0)
+        return argv
+
+    def _launch_path(self, calls):
+        argv = shlex.split(self._new_session(calls)[-1])
+        self.assertTrue(argv[0].startswith("PATH="), argv[0])
+        return argv[0][len("PATH="):].split(os.pathsep)
+
+
     def test_session_alive_reads_has_session(self):
         runner, _ = self._runner(alive=True)
         self.assertTrue(cli.session_alive(runner))
@@ -1925,7 +1969,7 @@ class TestCliLifecycle(_CliEnv):
         self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
         command = self._new_session(calls)[-1]
         self.assertNotIn("-m dispatch.cli", command)
-        argv = shlex.split(command)
+        argv = self._launch_argv(calls)
         self.assertEqual(argv[0], sys.executable)
         self.assertEqual(os.path.basename(argv[1]), "dispatchd")
         self.assertTrue(os.path.exists(argv[1]), argv[1])
@@ -2012,6 +2056,63 @@ class TestCliLifecycle(_CliEnv):
         self.assertEqual(code, 0)
         self.assertIn("step output", out)
 
+    def test_up_pins_a_path_the_agents_can_be_found_on(self):
+        """The session inherits the tmux server's environment, and after a
+        reboot the server is the one cron started -- `/usr/bin:/bin`, without
+        the directory the agents install into. The daemon would look healthy,
+        the watchdog would stay quiet, chat would answer, and every task would
+        fail with command-not-found. So the launch pins PATH itself.
+        """
+        agent_bin = self._write_agents(
+            os.path.join(self.tmp.name, "agent-bin"), "claude", "codex")
+        with mock.patch.dict(os.environ,
+                             {"PATH": os.pathsep.join(["/usr/bin", agent_bin])}):
+            runner, calls = self._runner(alive=False)
+            code, _, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+            resolved = os.path.dirname(shutil.which("claude"))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        directories = self._launch_path(calls)
+        # The directory `claude` actually resolves to, not one assumed for it.
+        self.assertIn(resolved, directories)
+        self.assertIn(agent_bin, directories)
+
+    def test_up_adds_the_user_bin_directory_a_cron_path_lacks(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            runner, calls = self._runner(alive=False)
+            self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        directories = self._launch_path(calls)
+        self.assertIn(os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                      directories)
+        self.assertEqual(directories[:2], ["/usr/bin", "/bin"])
+
+    def test_up_warns_when_the_pinned_path_still_cannot_reach_an_agent(self):
+        """It starts anyway -- one working lane still answers chat, and refusing
+        would take the only surface down too -- but this is the failure that
+        looks like success, so it is said out loud."""
+        empty = os.path.join(self.tmp.name, "empty-bin")
+        os.makedirs(empty)
+        with mock.patch.dict(os.environ, {"PATH": empty}):
+            runner, _ = self._runner(alive=False)
+            code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn("started dispatchd", out)
+        self.assertIn("claude", err)
+        self.assertIn("codex", err)
+
+    def test_down_reports_a_kill_that_failed(self):
+        def runner(argv, **kwargs):
+            class Result:
+                returncode = 0 if argv[:2] == ["tmux", "has-session"] else 1
+                stdout = ""
+                stderr = "" if argv[:2] == ["tmux", "has-session"] else "server exited"
+            return Result()
+
+        code, out, err = self._capture(cli.cmd_down, _Args(runner=runner))
+        self.assertEqual(code, 1)
+        self.assertNotIn("stopped", out)
+        self.assertIn("server exited", err)
+
     def test_the_parser_wires_up_down_and_logs_daemon(self):
         parser_ = cli.build_parser()
         self.assertIs(parser_.parse_args(["up"]).func, cli.cmd_up)
@@ -2084,6 +2185,57 @@ class TestCliSetup(_CliEnv):
         self.assertIsNone(cli.disable_plugin(path))
         self.assertFalse(os.path.exists(path + ".bak"))
 
+    def test_a_failed_write_names_the_backup_and_leaves_the_file_alone(self):
+        """The one path where cmd_setup's "backup: ..." line never prints.
+
+        A traceback out of main() would tell the user their settings file is in
+        trouble and not where the copy of it went.
+        """
+        path = self._settings()
+        with mock.patch("os.replace", side_effect=OSError("no space left on device")):
+            result, out, err = self._capture(cli.disable_plugin, path)
+        self.assertIsNone(result)
+        self.assertEqual(out, "")
+        self.assertIn(path + ".bak", err)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), self.ORIGINAL)
+        with open(path + ".bak") as fh:
+            self.assertEqual(fh.read(), self.ORIGINAL)
+        leftovers = [name for name in os.listdir(os.path.dirname(path))
+                     if name.startswith(".dispatch-")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_failed_backup_changes_nothing(self):
+        path = self._settings()
+        with mock.patch("builtins.open", side_effect=_only_writes_fail(path + ".bak")):
+            result, _, err = self._capture(cli.disable_plugin, path)
+        self.assertIsNone(result)
+        self.assertIn("nothing was changed", err)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), self.ORIGINAL)
+
+    def test_a_symlinked_settings_file_stays_a_symlink(self):
+        """Renaming onto the link would leave the user with a regular file
+        where they had put a link into a dotfiles checkout."""
+        real = os.path.join(self.tmp.name, "real-settings.json")
+        with open(real, "w") as fh:
+            fh.write(self.ORIGINAL)
+        link = os.path.join(self.tmp.name, "settings.json")
+        os.symlink(real, link)
+        backup = cli.disable_plugin(link)
+        self.assertEqual(backup, link + ".bak")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link), real)
+        with open(real) as fh:
+            self.assertFalse(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
+
+    def test_both_files_keep_the_original_permissions(self):
+        path = self._settings()
+        os.chmod(path, 0o640)
+        backup = cli.disable_plugin(path)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(os.stat(backup).st_mode), 0o640)
+
     def test_setup_disables_the_plugin_and_writes_config(self):
         path = self._settings()
         code, out, _ = self._capture(cli.cmd_setup, _Args(
@@ -2106,9 +2258,9 @@ class TestCliSetup(_CliEnv):
             self.assertTrue(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
         self.assertFalse(os.path.exists(path + ".bak"))
 
-    def test_setup_no_longer_refuses(self):
-        """The 2026-08-18 refusal protected a peer interface. That interface is
-        the thing being replaced now, and leaving it on guarantees the 409."""
+    def test_the_setup_parser_swaps_force_for_keep_plugin(self):
+        """Parser wiring only. That `setup` actually disables the plugin is
+        `test_setup_disables_the_plugin_and_writes_config`'s job."""
         parser_ = cli.build_parser()
         self.assertTrue(parser_.parse_args(["setup", "--keep-plugin"]).keep_plugin)
         with contextlib.redirect_stderr(io.StringIO()):

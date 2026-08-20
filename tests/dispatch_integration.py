@@ -397,11 +397,32 @@ class DispatchIntegration(unittest.TestCase):
         home = os.path.join(self.tmp.name, "up-home")
         env = dict(os.environ, DISPATCH_HOME=home)
         command, cwd = cli_mod._daemon_argv()
-        out = subprocess.run(shlex.split(command) + ["--ticks", "0"], cwd=cwd,
+        # Through a shell, because that is how tmux runs it -- and because the
+        # PATH the daemon must have rides on the command as an assignment prefix.
+        out = subprocess.run(["sh", "-c", command + " --ticks 0"], cwd=cwd,
                              capture_output=True, text=True, env=env,
                              stdin=subprocess.DEVNULL)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(os.path.isdir(os.path.join(home, "locks")), out.stdout)
+
+    def test_the_launch_command_pins_path_through_the_shell(self):
+        """The daemon's children exec a bare `claude` and a bare `codex`.
+
+        tmux gives a session the server's environment, and after a reboot the
+        server is whichever one cron started, so the PATH has to come from the
+        command rather than be inherited. Measured on tmux 3.6, `new-session -e
+        PATH=` is ignored and this prefix is not; here it is proved against a
+        real shell with a deliberately bare ambient PATH.
+        """
+        from dispatch import cli as cli_mod
+
+        pinned = cli_mod.daemon_path()
+        seen = subprocess.run(
+            ["sh", "-c", "PATH=%s printenv PATH" % shlex.quote(pinned)],
+            capture_output=True, text=True,
+            env=dict(os.environ, PATH="/usr/bin:/bin"))
+        self.assertEqual(seen.returncode, 0, seen.stderr)
+        self.assertEqual(seen.stdout.strip(), pinned)
 
     def test_setup_disables_the_conflicting_chat_plugin(self):
         settings = os.path.join(self.tmp.name, "settings.json")

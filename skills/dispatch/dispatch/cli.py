@@ -8,8 +8,11 @@ import argparse
 import json
 import os
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 from . import config as config_mod
@@ -18,6 +21,7 @@ from . import governor, lanes, state, usage
 
 PLUGIN_KEY = "telegram@claude-plugins-official"
 TMUX_SESSION = "dispatchd"
+AGENTS = ("claude", "codex")
 
 
 def _snapshot(now=None):
@@ -185,6 +189,30 @@ def session_alive(runner=None):
     return _tmux(["has-session", "-t", TMUX_SESSION], runner).returncode == 0
 
 
+def daemon_path():
+    """The PATH to pin on the daemon, rather than whatever it would inherit.
+
+    ``new-session`` starts the tmux server with the caller's environment when no
+    server is running, and every process in the session inherits it -- the
+    daemon, and the workers it execs a bare ``claude`` or ``codex`` through, and
+    ``usage.poll``. The cron watchdog wins that race after a reboot, so the
+    environment is cron's: ``/usr/bin:/bin``, without the user bin directory both
+    agents install into. Nothing would look wrong -- the session exists, so the
+    watchdog stays quiet; the daemon is healthy, so chat answers -- and every
+    task would fail with command-not-found.
+
+    The launcher's own PATH, plus ``~/.local/bin`` when it is missing, which is
+    where both agents live. Appended rather than prepended: a human running
+    `dispatch up` should get the same agent their shell would.
+    """
+    parts = [part for part in (os.environ.get("PATH") or "").split(os.pathsep)
+             if part]
+    user_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    if user_bin not in parts:
+        parts.append(user_bin)
+    return os.pathsep.join(parts)
+
+
 def _daemon_argv():
     """The command the tmux session runs, and the directory it runs it in.
 
@@ -196,10 +224,17 @@ def _daemon_argv():
     module has no ``__main__`` guard, so ``-m`` would import it and exit 0 --
     tmux would report a successful launch of a session that was already gone,
     and the watchdog would do it again five minutes later, forever.
+
+    PATH rides on the command as an assignment prefix, not as ``new-session -e``:
+    measured on tmux 3.6, a pane takes its PATH from the server and an ``-e
+    PATH=`` is silently ignored, while the prefix is applied by the shell tmux
+    runs the command through.
     """
     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     script = os.path.join(package, "scripts", "dispatchd")
-    return "%s %s" % (shlex.quote(sys.executable), shlex.quote(script)), package
+    command = "PATH=%s %s %s" % (shlex.quote(daemon_path()),
+                                 shlex.quote(sys.executable), shlex.quote(script))
+    return command, package
 
 
 def cmd_up(args):
@@ -216,6 +251,14 @@ def cmd_up(args):
         print("failed to start: %s" % (result.stderr or "").strip(), file=sys.stderr)
         return 1
     print("started dispatchd in tmux session '%s'" % TMUX_SESSION)
+    missing = [agent for agent in AGENTS
+               if shutil.which(agent, path=daemon_path()) is None]
+    if missing:
+        # Starting anyway: a daemon with one working lane still answers chat,
+        # and refusing would take the only surface down with it. But this is the
+        # failure that looks like success, so it is said out loud.
+        print("warning: %s not on the daemon's PATH; that lane will fail with "
+              "command-not-found" % ", ".join(missing), file=sys.stderr)
     return 0
 
 
@@ -224,7 +267,14 @@ def cmd_down(args):
     if not session_alive(runner):
         print("dispatchd is not running")
         return 0
-    _tmux(["kill-session", "-t", TMUX_SESSION], runner)
+    result = _tmux(["kill-session", "-t", TMUX_SESSION], runner)
+    if result.returncode != 0:
+        # "exactly one consumer of the bot token" is the premise of the whole
+        # cutover, so being told it stopped when it did not is the wrong
+        # direction to be wrong in.
+        print("failed to stop dispatchd: %s" % (result.stderr or "").strip(),
+              file=sys.stderr)
+        return 1
     print("stopped dispatchd")
     return 0
 
@@ -241,6 +291,14 @@ def _plugin_enabled(settings_path):
     return PLUGIN_KEY in enabled
 
 
+def _copy_mode(source, target):
+    """Give ``target`` ``source``'s permissions. Best effort; it is a copy."""
+    try:
+        os.chmod(target, stat.S_IMODE(os.stat(source).st_mode))
+    except OSError:
+        pass
+
+
 def disable_plugin(settings_path):
     """Turn the conflicting chat plugin off. Returns the backup path, or None.
 
@@ -249,6 +307,13 @@ def disable_plugin(settings_path):
     backup is to put back exactly what was there -- a reformatted one would
     still rewrite the file the user asked us not to rewrite. For the same reason
     the edit keeps the original key order instead of sorting.
+
+    The new content is renamed into place over ``realpath``: atomic, so there is
+    no instant in which the user's settings exist truncated, and still the same
+    inode a symlinked ``settings.json`` points at rather than a regular file
+    replacing the link. Nothing here raises -- on the one path where the file
+    cannot be written, ``cmd_setup``'s "backup: ..." line would never print, so
+    this says where the copy went itself.
     """
     try:
         with open(settings_path) as fh:
@@ -261,13 +326,38 @@ def disable_plugin(settings_path):
     enabled = settings.get("enabledPlugins")
     if not isinstance(enabled, dict) or not enabled.get(PLUGIN_KEY):
         return None
+
     backup = settings_path + ".bak"
-    with open(backup, "w") as fh:
-        fh.write(original)
+    try:
+        with open(backup, "w") as fh:
+            fh.write(original)
+        _copy_mode(settings_path, backup)
+    except OSError as exc:
+        print("could not back up %s: %s · nothing was changed"
+              % (settings_path, exc), file=sys.stderr)
+        return None
+
     enabled[PLUGIN_KEY] = False
-    with open(settings_path, "w") as fh:
-        json.dump(settings, fh, indent=2)
-        fh.write("\n")
+    target = os.path.realpath(settings_path)
+    try:
+        handle, temporary = tempfile.mkstemp(
+            dir=os.path.dirname(target) or ".", prefix=".dispatch-settings-")
+        try:
+            with os.fdopen(handle, "w") as fh:
+                json.dump(settings, fh, indent=2)
+                fh.write("\n")
+            _copy_mode(target, temporary)
+            os.replace(temporary, target)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        print("could not write %s: %s · it is unchanged and a copy of it is at %s"
+              % (settings_path, exc, backup), file=sys.stderr)
+        return None
     return backup
 
 
