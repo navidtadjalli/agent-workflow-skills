@@ -157,17 +157,23 @@ def estimate(snapshot, now, tokens_now):
     either nothing has ever been polled, or the session window rolled over and
     the token baseline no longer corresponds to the new window.
     """
+    # `week_resets_at` rides along on every branch: a lane frozen by the weekly
+    # window has to arm its resume for when *that* window rolls over, not for
+    # the session reset an hour from now.
+    week_reset = snapshot.get("week_reset")
+
     override = snapshot.get("override_until")
     if override and now < override:
         return {"session_pct": 100.0, "week_pct": snapshot.get("week_pct") or 100.0,
                 "source": "limit-error", "stale": False,
-                "resets_at": override}
+                "resets_at": override, "week_resets_at": week_reset}
 
     session_pct = snapshot.get("session_pct")
     if session_pct is None or snapshot.get("tokens_at_poll") is None:
         return {"session_pct": None, "week_pct": snapshot.get("week_pct"),
                 "source": "unknown", "stale": True,
-                "resets_at": snapshot.get("session_reset")}
+                "resets_at": snapshot.get("session_reset"),
+                "week_resets_at": week_reset}
 
     reset = snapshot.get("session_reset")
     if reset and now >= reset:
@@ -175,7 +181,8 @@ def estimate(snapshot, now, tokens_now):
         # baseline is from the previous window, so demand a fresh poll before
         # anything is admitted on the strength of it.
         return {"session_pct": 0.0, "week_pct": snapshot.get("week_pct"),
-                "source": "post-reset", "stale": True, "resets_at": None}
+                "source": "post-reset", "stale": True, "resets_at": None,
+                "week_resets_at": week_reset}
 
     burned = max(0, tokens_now - snapshot["tokens_at_poll"])
     session_ratio = snapshot.get("session_ratio") or SEED_PCT_PER_TOKEN
@@ -187,6 +194,7 @@ def estimate(snapshot, now, tokens_now):
         "source": "measured" if burned == 0 else "projected",
         "stale": False,
         "resets_at": reset,
+        "week_resets_at": week_reset,
     }
 
 

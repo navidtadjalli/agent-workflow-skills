@@ -23,6 +23,12 @@ STATE_EMPTY = {
     "governor": {},
     "armed_resume_at": {"claude": None, "codex": None},
     "repo_cost_pct": {},
+    # Chat transport health. Never the token itself -- see ``chat.Chat._redact``.
+    "chat_last_error": None,
+    "chat_failures": 0,
+    "chat_error_at": None,
+    # Per lane: why the last dispatch pass started nothing.
+    "hold_reason": {},
 }
 
 

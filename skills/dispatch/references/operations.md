@@ -71,10 +71,14 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Task `failed`, log looks complete | Worker omitted its status block | `dispatch logs <id>`, then re-add with the acceptance restated |
 | Everything `blocked` on one repo | Repo path missing from config | Re-run `dispatch setup --repo alias=path` |
 | Mode stays `frozen` past the reset | Reset time was misparsed | `dispatch usage --poll`, then `dispatch resume` |
+| A lane reads `frozen` with a low session percentage | Its weekly window is at or above the soft limit | Nothing: it resumes when the week resets. `dispatch status` shows both windows |
+| The bot answers nothing, everything else looks healthy | Chat transport is failing | `dispatch status` prints the last transport error and how many polls have failed in a row |
+| Session gone, no explanation in the pane | The daemon died with it | `dispatch logs --daemon` falls back to `daemon.log`, which outlives the session |
+| Task `failed` with `checkpoint failed: ...` | The step's work could not be committed | Fix the repo (a stale lock, a conflicting ref), then re-add; the tree still holds the work |
 
 ## Safety
 
 Workers run without permission prompts, so repository content is untrusted input
-to an unattended agent. Only aliased repos are dispatchable, and that alias list
-is the entire trust boundary -- keep it short. Workers never push and never
+to an unattended agent. Every git repo under the projects root is dispatchable
+-- that is the trust boundary, and the `repos` chat verb is what prints it. Workers never push and never
 commit to the default branch; every checkpoint lands on the task branch.

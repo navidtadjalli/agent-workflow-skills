@@ -29,10 +29,17 @@ def pct_line(reading):
     Both ``estimate`` functions return the same keys on purpose, so there is
     one renderer rather than one per surface -- chat, `dispatch status` and
     `dispatch usage` must never disagree about what a lane is doing.
+
+    ``session_known: False`` means the governor had no session percentage to
+    read and substituted a permissive zero for admission. Rendering that as
+    ``session 0%`` says "an empty window" when it means "no reading at all" --
+    the difference between a lane with everything to spend and a lane nobody
+    has measured.
     """
     if reading.get("session_pct") is None:
         return "unknown"
-    parts = ["session %.0f%%" % reading["session_pct"]]
+    parts = ["session %s" % ("--" if reading.get("session_known") is False
+                             else "%.0f%%" % reading["session_pct"])]
     if reading.get("week_pct") is not None:
         parts.append("week %.0f%%" % reading["week_pct"])
     parts.append(reading.get("source") or "unknown")

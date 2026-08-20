@@ -199,7 +199,10 @@ run_python_suite() {
   local script="$2"
   local log="$tmp_dir/$(basename "$script").log"
 
-  if ! python3 "$script" >"$log" 2>&1; then
+  # -W error: the suites are held to pristine output, and a warning nobody
+  # sees is how that constraint quietly stops being true. The log is only
+  # printed on failure, so a warning that is not an error is invisible here.
+  if ! python3 -W error "$script" >"$log" 2>&1; then
     cat "$log" >&2
     fail "$label"
   fi

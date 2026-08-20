@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -1298,6 +1299,13 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self._previous = os.environ.get("DISPATCH_HOME")
         os.environ["DISPATCH_HOME"] = os.path.join(self.tmp.name, "home")
         self.addCleanup(self._restore)
+        # The daemon reads this path when it builds its own transport. Nothing
+        # here may so much as stat the developer's real channel token.
+        token = mock.patch.dict(
+            os.environ,
+            {"DISPATCH_TOKEN_ENV": os.path.join(self.tmp.name, "absent.env")})
+        token.start()
+        self.addCleanup(token.stop)
         self.projects = os.path.join(self.tmp.name, "Projects")
         for name in ("qpay", "poook"):
             os.makedirs(os.path.join(self.projects, name, ".git"))
@@ -1311,10 +1319,18 @@ class TestTwoLaneDaemon(unittest.TestCase):
         else:
             os.environ["DISPATCH_HOME"] = self._previous
 
-    def _daemon(self, claude_pct=10.0, codex_pct=10.0, run_step=None):
+    def _daemon(self, claude_pct=10.0, codex_pct=10.0, run_step=None,
+                checkpoint=None):
         from dispatch import chat as chat_mod
         from dispatch import daemon as daemon_mod
         daemon = daemon_mod.Daemon(
+            # The repos here are `.git` directories, not repositories: a real
+            # checkpoint cannot succeed against them, and a settle that ignores
+            # that is the bug `test_a_failed_checkpoint_...` covers. Injected,
+            # so these tests assert on lane behaviour and the integration suite
+            # keeps the real git path.
+            checkpoint=checkpoint or (lambda task, cwd, message: {
+                "ok": True, "committed": True}),
             config={"projects_root": self.projects, "chat_allowlist": ["1"]},
             clock=lambda: self.now,
             poll_usage=lambda: {"ok": True, "at": self.now,
@@ -1675,6 +1691,370 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertEqual(state.read_state()["chat_offset"], 8)
         self.assertEqual(state.read_queue()["tasks"][0]["state"], "done")
 
+    # -- the week window, which the mode machine used to ignore --------------
+
+    def _week_exhausted_codex(self, daemon, week_pct=100.0):
+        daemon.codex_estimate = lambda now: {
+            "session_pct": 0.0, "session_known": False, "week_pct": week_pct,
+            "source": "codex-logs", "stale": False,
+            "resets_at": self.now + 3600, "week_resets_at": self.now + 86400}
+
+    def test_a_lane_at_100_percent_of_its_week_freezes_instead_of_running(self):
+        """`admit` refuses at the weekly soft limit and the mode machine did
+        not, so the lane reported `running` -- "dispatching normally" -- while
+        dispatching nothing at all. This is the codex lane's real state."""
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "poook", "codex work", agent="codex")
+        result = daemon.tick()
+        self.assertEqual(result["mode"][lanes.CODEX], winddown.FROZEN)
+        self.assertEqual(state.read_state()["mode"][lanes.CODEX], winddown.FROZEN)
+        self.assertEqual(result["mode"][lanes.CLAUDE], winddown.RUNNING)
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "queued")
+
+    def test_the_ack_for_a_week_exhausted_lane_does_not_claim_it_is_running(self):
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        daemon.chat = _ScriptedChat("codex bump deps on poook", update_id=3)
+        daemon.tick()
+        reply = daemon.chat.sent[-1][1]
+        self.assertIn("queued t-0001", reply)
+        self.assertIn(winddown.FROZEN, reply)
+        self.assertNotIn(winddown.RUNNING, reply)
+
+    def test_a_week_freeze_waits_for_the_week_to_reset_not_the_session(self):
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        daemon.tick()
+        self.assertEqual(state.read_state()["armed_resume_at"][lanes.CODEX],
+                         self.now + 86400 + winddown.RESUME_DELAY)
+
+    def test_the_freeze_notice_does_not_report_a_missing_reading_as_zero(self):
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        daemon.tick()
+        frozen = [notice for notice in daemon.notices if "frozen" in notice]
+        self.assertEqual(len(frozen), 1, daemon.notices)
+        self.assertIn("7d 100%", frozen[0])
+        self.assertNotIn("5h 0%", frozen[0])
+
+    def test_a_week_frozen_lane_does_not_flap_back_to_running(self):
+        """The session window is fine and the timer has fired; only the week
+        is full. Resuming here would re-freeze on the next tick and send a
+        freeze notice every tick until the week rolled over."""
+        daemon = self._daemon()
+        self._week_exhausted_codex(daemon)
+        daemon.tick()
+        with state.mutate_state() as doc:
+            doc["armed_resume_at"][lanes.CODEX] = self.now - 1
+        self.assertEqual(daemon.tick()["mode"][lanes.CODEX], winddown.FROZEN)
+        freezes = [n for n in daemon.notices if "frozen" in n]
+        self.assertEqual(len(freezes), 1, daemon.notices)
+
+    def test_a_week_frozen_claude_lane_does_not_re_poll_every_tick(self):
+        """The armed timer fires on the session reset, which cannot help: only
+        the week rolling over can, and the idle cadence already covers that."""
+        daemon = self._daemon()
+        polled = []
+        original = daemon.poll_usage
+        daemon.poll_usage = lambda: polled.append(1) or original()
+        with state.mutate_state() as doc:
+            doc["mode"][lanes.CLAUDE] = winddown.FROZEN
+            doc["armed_resume_at"][lanes.CLAUDE] = self.now - 10
+            doc["governor"] = dict(governor.blank(), polled_at=self.now - 61,
+                                   session_pct=3.0, tokens_at_poll=0,
+                                   session_reset=self.now + 3600,
+                                   week_pct=100.0, week_reset=self.now + 86400)
+        daemon.tick()
+        daemon.tick()
+        self.assertEqual(polled, [])
+        self.assertEqual(state.read_state()["mode"][lanes.CLAUDE], winddown.FROZEN)
+
+    def test_the_status_line_stops_reporting_a_missing_reading_as_zero(self):
+        daemon = self._daemon()
+        readings = {lanes.CLAUDE: {"session_pct": 1.0, "week_pct": 1.0,
+                                   "stale": False, "source": "measured",
+                                   "resets_at": None},
+                    lanes.CODEX: {"session_pct": 0.0, "session_known": False,
+                                  "week_pct": 100.0, "stale": False,
+                                  "source": "codex-unknown", "resets_at": None}}
+        line = daemon.status_line({lanes.CLAUDE: "running", lanes.CODEX: "frozen"},
+                                  governor.blank(), readings, self.now, 0)
+        codex_line = [row for row in line.splitlines() if row.startswith("codex")][0]
+        self.assertIn("frozen", codex_line)
+        self.assertIn("week 100%", codex_line)
+        self.assertNotIn("session 0%", codex_line)
+
+
+    # -- why a running lane started nothing ---------------------------------
+
+    def test_a_lane_that_starts_nothing_records_the_reason_admission_gave(self):
+        """`admit` returns a reason string and the dispatch pass threw it away.
+        A `running` lane whose queue never moves is the hardest state to read
+        from a chat window."""
+        daemon = self._daemon()
+        daemon.executor = _NeverFinishes()
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "first", agent="claude")
+            state.new_task(queue, "qpay", "second", agent="claude")
+        daemon.tick()
+        reason = state.read_state()["hold_reason"][lanes.CLAUDE]
+        self.assertIn("t-0002", reason)
+        self.assertIn("busy", reason)
+        readings = {lanes.CLAUDE: {"session_pct": 1.0, "week_pct": 1.0,
+                                   "stale": False, "source": "measured",
+                                   "resets_at": None},
+                    lanes.CODEX: {"session_pct": 1.0, "week_pct": 1.0,
+                                  "stale": False, "source": "codex-logs",
+                                  "resets_at": None}}
+        line = daemon.status_line({lanes.CLAUDE: "running", lanes.CODEX: "running"},
+                                  governor.blank(), readings, self.now, 0)
+        self.assertIn("holding:", line)
+        self.assertIn("t-0002", line)
+
+    def test_the_headroom_refusal_is_explained_too(self):
+        """The one refusal that leaves the mode `running` and the queue still."""
+        daemon = self._daemon(claude_pct=82.0)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        result = daemon.tick()
+        self.assertEqual(result["mode"][lanes.CLAUDE], winddown.RUNNING)
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "queued")
+        self.assertIn("soft limit", state.read_state()["hold_reason"][lanes.CLAUDE])
+
+    def test_an_empty_lane_is_not_holding_anything(self):
+        daemon = self._daemon()
+        daemon.tick()
+        doc = state.read_state()
+        # Nothing to explain, and nothing written to say so.
+        self.assertEqual(doc["hold_reason"], {})
+        from dispatch import daemon as daemon_mod
+        self.assertIsNone(daemon_mod.hold_line(doc, lanes.CLAUDE, winddown.RUNNING))
+
+    def test_a_hold_is_not_reported_for_a_lane_that_is_not_running(self):
+        """Every other mode explains itself; a stale hold under it would not."""
+        from dispatch import daemon as daemon_mod
+        doc = {"hold_reason": {lanes.CODEX: "t-0001 mode is frozen"}}
+        self.assertIsNone(daemon_mod.hold_line(doc, lanes.CODEX, winddown.FROZEN))
+        self.assertIsNotNone(daemon_mod.hold_line(doc, lanes.CODEX, winddown.RUNNING))
+
+    # -- the transport, and what happens when it is gone --------------------
+
+    def test_a_chat_failure_is_recorded_printed_and_reported(self):
+        """A dead transport looks exactly like silence: daemon up, queue
+        healthy, watchdog quiet, bot answering nothing."""
+        daemon = self._daemon()
+        daemon.chat = _BrokenChat("HTTPError: HTTP Error 409: Conflict", failures=0)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            daemon.tick()
+        doc = state.read_state()
+        self.assertEqual(doc["chat_last_error"], "HTTPError: HTTP Error 409: Conflict")
+        self.assertEqual(doc["chat_failures"], 1)
+        self.assertEqual(doc["chat_error_at"], self.now)
+        self.assertIn("409", err.getvalue())
+        readings = {lanes.CLAUDE: {"session_pct": 1.0, "week_pct": 1.0,
+                                   "stale": False, "source": "measured",
+                                   "resets_at": None},
+                    lanes.CODEX: {"session_pct": 1.0, "week_pct": 1.0,
+                                  "stale": False, "source": "codex-logs",
+                                  "resets_at": None}}
+        line = daemon.status_line({lanes.CLAUDE: "running", lanes.CODEX: "running"},
+                                  governor.blank(), readings, self.now, 0)
+        self.assertIn("409", line)
+
+    def test_a_standing_chat_failure_is_not_reprinted_every_tick(self):
+        """The count climbs on every tick of an outage; the message does not,
+        and the pane has to stay readable."""
+        daemon = self._daemon()
+        daemon.chat = _BrokenChat("HTTPError: HTTP Error 409: Conflict", failures=0)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            for _ in range(5):
+                daemon.tick()
+        self.assertEqual(err.getvalue().count("chat transport error"), 1)
+        self.assertEqual(state.read_state()["chat_failures"], 5)
+
+    def test_a_recovered_transport_clears_the_report(self):
+        from dispatch import chat as chat_mod
+        daemon = self._daemon()
+        daemon.chat = _BrokenChat("HTTPError: HTTP Error 409: Conflict")
+        with contextlib.redirect_stderr(io.StringIO()):
+            daemon.tick()
+        daemon.chat = chat_mod.NullChat()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            daemon.tick()
+        self.assertIsNone(state.read_state()["chat_last_error"])
+        self.assertIn("recovered", err.getvalue())
+        line = daemon.status_line(
+            {lanes.CLAUDE: "running", lanes.CODEX: "running"}, governor.blank(),
+            {lanes.CLAUDE: {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                            "source": "measured", "resets_at": None},
+             lanes.CODEX: {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                           "source": "codex-logs", "resets_at": None}},
+            self.now, 0)
+        self.assertNotIn("chat", line)
+
+    def test_a_missing_token_is_a_reported_condition_not_a_silent_downgrade(self):
+        daemon = self._daemon()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            chat = daemon._default_chat()
+        self.assertIn("no bot token", chat.last_error)
+        self.assertIn("no bot token", err.getvalue())
+
+    # -- crash handling ------------------------------------------------------
+
+    def test_a_tick_that_raises_does_not_take_the_daemon_with_it(self):
+        """The tmux session dies with the process, and the traceback with the
+        pane. A deterministic error would be a permanent lockout."""
+        daemon = self._daemon()
+        ticks = []
+
+        def explode():
+            ticks.append(1)
+            raise RuntimeError("kaboom")
+
+        daemon.tick = explode
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            daemon.run(interval=0, ticks=3, sleeper=lambda seconds: None)
+        self.assertEqual(len(ticks), 3)
+        self.assertIn("kaboom", err.getvalue())
+        with open(config_mod.daemon_log_path()) as fh:
+            log = fh.read()
+        self.assertEqual(log.count("tick failed"), 3)
+        self.assertIn("RuntimeError: kaboom", log)
+
+    def test_the_crash_log_does_not_grow_without_bound(self):
+        """A tick that raises every interval writes a traceback every
+        interval. A full disk is a worse failure than the one being logged."""
+        from dispatch import daemon as daemon_mod
+        daemon = self._daemon()
+        config_mod.ensure_dirs()
+        path = config_mod.daemon_log_path()
+        with open(path, "w") as fh:
+            fh.write("x" * (daemon_mod.DAEMON_LOG_MAX + 1))
+        with contextlib.redirect_stderr(io.StringIO()):
+            daemon.log_crash("RuntimeError: kaboom")
+        self.assertTrue(os.path.exists(path + ".1"))
+        with open(path) as fh:
+            body = fh.read()
+        self.assertIn("kaboom", body)
+        self.assertLess(len(body), 1000)
+
+    def test_a_daemon_log_that_cannot_be_written_is_not_fatal_either(self):
+        daemon = self._daemon()
+        with mock.patch("builtins.open", side_effect=OSError("read-only file system")):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                daemon.log_crash("Traceback: nowhere to put this")
+        self.assertIn("could not write", err.getvalue())
+        self.assertIn("nowhere to put this", err.getvalue())
+
+    # -- a checkpoint that did not happen ------------------------------------
+
+    def test_a_failed_checkpoint_fails_the_task_instead_of_reporting_done(self):
+        """`done` on an empty branch is the one outcome the wind-down contract
+        rules out: work is parked, never lost."""
+        daemon = self._daemon(checkpoint=lambda task, cwd, message: {
+            "ok": False, "error": "fatal: cannot lock ref 'refs/heads/tg/t-0001'"})
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        task = state.read_queue()["tasks"][0]
+        self.assertEqual(task["state"], "failed")
+        self.assertIn("cannot lock ref", task["last_error"])
+        self.assertTrue(any("not committed" in notice for notice in daemon.notices),
+                        daemon.notices)
+        directory = config_mod.task_dir("t-0001")
+        with open(os.path.join(directory, "steps.jsonl")) as fh:
+            step = json.loads(fh.read().strip())
+        self.assertIn("cannot lock ref", step["checkpoint_error"])
+        self.assertTrue(os.path.exists(os.path.join(directory, "handoff.md")))
+
+    def test_a_successful_checkpoint_still_settles_normally(self):
+        daemon = self._daemon(checkpoint=lambda task, cwd, message: {
+            "ok": True, "committed": True})
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "done")
+        with open(os.path.join(config_mod.task_dir("t-0001"), "steps.jsonl")) as fh:
+            self.assertIsNone(json.loads(fh.read().strip())["checkpoint_error"])
+
+    # -- stored free-form text, which nothing used to come back for ----------
+
+    def _stored(self, text="tidy the deps everywhere"):
+        with state.mutate_queue() as queue:
+            task = state.new_task(queue, "?", text)
+            task["state"] = "needs_parse"
+        return task["id"]
+
+    def test_stored_text_is_parsed_on_a_later_tick(self):
+        daemon = self._daemon()
+        seen = []
+        daemon.freeform = lambda text: (
+            seen.append(text) or [{"repo": "qpay", "prompt": "tidy deps"}], None)
+        self._stored()
+        daemon.tick()
+        tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
+        self.assertEqual(seen, ["tidy the deps everywhere"])
+        self.assertEqual(tasks["t-0001"]["state"], "parsed")
+        self.assertEqual(tasks["t-0002"]["repo"], "qpay")
+
+    def test_stored_text_is_left_alone_while_the_lane_is_not_running(self):
+        daemon = self._daemon(claude_pct=99.0)
+        seen = []
+        daemon.freeform = lambda text: (seen.append(text), (None, "no model"))[1]
+        self._stored()
+        daemon.tick()
+        self.assertEqual(seen, [])
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "needs_parse")
+
+    def test_only_one_stored_message_is_parsed_per_tick(self):
+        """The parse is a subprocess with a two-minute cap, on the loop that
+        also answers chat."""
+        daemon = self._daemon()
+        seen = []
+        daemon.freeform = lambda text: (
+            seen.append(text) or [{"repo": "qpay", "prompt": "x"}], None)
+        self._stored("first")
+        self._stored("second")
+        daemon.tick()
+        self.assertEqual(seen, ["first"])
+
+    def test_a_parse_that_keeps_failing_is_handed_back_not_retried_forever(self):
+        from dispatch import daemon as daemon_mod
+        daemon = self._daemon()
+        seen = []
+        daemon.freeform = lambda text: (seen.append(text), (None, "no model"))[1]
+        self._stored()
+        for _ in range(6):
+            daemon.tick()
+        self.assertEqual(len(seen), daemon_mod.PARSE_ATTEMPTS)
+        task = state.read_queue()["tasks"][0]
+        self.assertEqual(task["state"], "blocked")
+        self.assertEqual(task["last_error"], "no model")
+        self.assertTrue(any("send it again" in notice for notice in daemon.notices),
+                        daemon.notices)
+
+
+class _BrokenChat:
+    """A transport that keeps failing, counting the way the real one does."""
+
+    def __init__(self, error, failures=1):
+        self.last_error = error
+        self.failures = failures
+        self.sent = []
+
+    def allowed(self, chat_id):
+        return True
+
+    def poll(self, offset):
+        self.failures += 1
+        return [], offset
+
+    def send(self, chat_id, text):
+        self.sent.append((chat_id, text))
+        return True
+
 
 class _NeverFinishes:
     """Executor whose futures stay pending, so `running` survives the tick."""
@@ -1883,6 +2263,53 @@ class TestCliLanes(_CliEnv):
             with self.assertRaises(SystemExit):
                 parser_.parse_args(["pause", "nonsense"])
 
+    def test_usage_reports_both_lanes_and_the_volume_block(self):
+        """The chat verb reports both governors plus volume; this reported the
+        Claude lane alone, on the surface you reach for when chat is down."""
+        now = time.time()
+        self._write_codex_limits(42.0, 8.0, now)
+        code, out, err = self._capture(cli.cmd_usage, _Args(poll=False))
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("CLAUDE", out)
+        self.assertIn("CODEX", out)
+        self.assertIn("42%", out)
+        self.assertIn("5h", out)  # the volume report
+
+    def test_usage_reads_the_configured_log_roots_not_a_home_directory(self):
+        """`volume` defaults to the home it was ported from; every other root
+        this CLI reads is configurable, and so is this one."""
+        now = time.time()
+        directory = os.path.join(self.transcripts, "-home-someone-proj")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "session.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+                "message": {"id": "m1", "model": "sonnet",
+                            "usage": {"input_tokens": 700000,
+                                      "output_tokens": 3}}}) + "\n")
+        _, out, _ = self._capture(cli.cmd_usage, _Args(poll=False))
+        self.assertIn("700", out.replace(".0K", "K"))
+
+    def test_status_repeats_why_a_running_lane_started_nothing(self):
+        with state.mutate_state() as doc:
+            doc["hold_reason"] = {lanes.CLAUDE: "t-0003 qpay is busy"}
+        _, out, _ = self._capture(cli.cmd_status, _Args())
+        self.assertIn("holding: t-0003 qpay is busy", out)
+
+    def test_status_reports_a_recorded_chat_failure(self):
+        with state.mutate_state() as doc:
+            doc["chat_last_error"] = "HTTPError: HTTP Error 409: Conflict"
+            doc["chat_failures"] = 12
+            doc["chat_error_at"] = time.time()
+        code, out, _ = self._capture(cli.cmd_status, _Args())
+        self.assertEqual(code, 0)
+        self.assertIn("409", out)
+        self.assertIn("12 consecutive", out)
+
+    def test_status_says_nothing_about_chat_when_it_is_working(self):
+        _, out, _ = self._capture(cli.cmd_status, _Args())
+        self.assertNotIn("chat", out)
+
     def test_a_pause_written_by_the_cli_survives_the_daemon(self):
         """The CLI is what the user reaches for when Telegram is down.
 
@@ -1899,8 +2326,16 @@ class TestCliLanes(_CliEnv):
 class TestCliLifecycle(_CliEnv):
     """`dispatch up/down/logs --daemon`. tmux is injected, never really run."""
 
-    def _runner(self, alive, stdout=""):
+    def _runner(self, alive, stdout="", survives=True):
+        """A fake tmux that remembers what it was told to do.
+
+        `up` now re-checks the session after creating it, so a runner that
+        answers `has-session` from a constant would report every launch as
+        having died. `survives=False` is the failure being modelled: the
+        session is created and the daemon dies before the check.
+        """
         calls = []
+        session = {"alive": alive}
 
         class Result:
             def __init__(self, code, out=""):
@@ -1911,7 +2346,11 @@ class TestCliLifecycle(_CliEnv):
         def runner(argv, **kwargs):
             calls.append(argv)
             if argv[:2] == ["tmux", "has-session"]:
-                return Result(0 if alive else 1)
+                return Result(0 if session["alive"] else 1)
+            if argv[:2] == ["tmux", "new-session"]:
+                session["alive"] = survives
+            if argv[:2] == ["tmux", "kill-session"]:
+                session["alive"] = False
             return Result(0, stdout)
 
         return runner, calls
@@ -1942,7 +2381,7 @@ class TestCliLifecycle(_CliEnv):
 
     def test_up_starts_a_detached_session_when_dead(self):
         runner, calls = self._runner(alive=False)
-        code, _, _ = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        code, _, _ = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         self.assertEqual(code, 0)
         started = self._new_session(calls)
         self.assertIn("-d", started)
@@ -1950,12 +2389,12 @@ class TestCliLifecycle(_CliEnv):
 
     def test_up_is_idempotent_when_alive(self):
         runner, calls = self._runner(alive=True)
-        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         self.assertEqual([c for c in calls if c[:2] == ["tmux", "new-session"]], [])
 
     def test_if_dead_is_silent_when_alive(self):
         runner, _ = self._runner(alive=True)
-        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=True, runner=runner))
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=True, runner=runner, settle=0))
         self.assertEqual((code, out, err), (0, "", ""))
 
     def test_up_launches_the_script_not_an_importable_module(self):
@@ -1966,7 +2405,7 @@ class TestCliLifecycle(_CliEnv):
         minutes forever. What `up` runs has to be the script with the guard.
         """
         runner, calls = self._runner(alive=False)
-        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         command = self._new_session(calls)[-1]
         self.assertNotIn("-m dispatch.cli", command)
         argv = self._launch_argv(calls)
@@ -1978,7 +2417,7 @@ class TestCliLifecycle(_CliEnv):
 
     def test_up_runs_the_session_from_the_package_directory(self):
         runner, calls = self._runner(alive=False)
-        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         started = self._new_session(calls)
         cwd = started[started.index("-c") + 1]
         self.assertTrue(os.path.isdir(os.path.join(cwd, "dispatch")), cwd)
@@ -1991,7 +2430,7 @@ class TestCliLifecycle(_CliEnv):
                 stderr = "no server running"
             return Result()
 
-        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         self.assertEqual(code, 1)
         self.assertIn("no server running", err)
         self.assertEqual(out, "")
@@ -2001,7 +2440,7 @@ class TestCliLifecycle(_CliEnv):
         def runner(argv, **kwargs):
             raise FileNotFoundError(2, "No such file or directory", "tmux")
 
-        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+        code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         self.assertEqual(code, 1)
         self.assertIn("tmux", err)
 
@@ -2068,10 +2507,12 @@ class TestCliLifecycle(_CliEnv):
         with mock.patch.dict(os.environ,
                              {"PATH": os.pathsep.join(["/usr/bin", agent_bin])}):
             runner, calls = self._runner(alive=False)
-            code, _, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+            code, _, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
             resolved = os.path.dirname(shutil.which("claude"))
         self.assertEqual(code, 0)
-        self.assertEqual(err, "")
+        # The token warning is expected here (this harness has no token file);
+        # what must not appear is a complaint about the agents.
+        self.assertNotIn("not on the daemon's PATH", err)
         directories = self._launch_path(calls)
         # The directory `claude` actually resolves to, not one assumed for it.
         self.assertIn(resolved, directories)
@@ -2080,7 +2521,7 @@ class TestCliLifecycle(_CliEnv):
     def test_up_adds_the_user_bin_directory_a_cron_path_lacks(self):
         with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
             runner, calls = self._runner(alive=False)
-            self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+            self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         directories = self._launch_path(calls)
         self.assertIn(os.path.join(os.path.expanduser("~"), ".local", "bin"),
                       directories)
@@ -2094,7 +2535,7 @@ class TestCliLifecycle(_CliEnv):
         os.makedirs(empty)
         with mock.patch.dict(os.environ, {"PATH": empty}):
             runner, _ = self._runner(alive=False)
-            code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner))
+            code, out, err = self._capture(cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
         self.assertEqual(code, 0)
         self.assertIn("started dispatchd", out)
         self.assertIn("claude", err)
@@ -2112,6 +2553,94 @@ class TestCliLifecycle(_CliEnv):
         self.assertEqual(code, 1)
         self.assertNotIn("stopped", out)
         self.assertIn("server exited", err)
+
+    def test_up_reports_a_session_that_died_on_startup(self):
+        """`new-session` returns 0 the moment the session exists; with
+        `remain-on-exit off` a daemon that dies during startup takes the
+        session with it milliseconds later. `up` said "started" regardless --
+        the same shape as the `-m dispatch.cli run` bug."""
+        config_mod.ensure_dirs()
+        with open(config_mod.daemon_log_path(), "w") as fh:
+            fh.write("dispatchd died at 2026-08-20 09:00:00\n"
+                     "Traceback (most recent call last):\n"
+                     "ModuleNotFoundError: No module named 'dispatch'\n")
+        runner, calls = self._runner(alive=False, survives=False)
+        code, out, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertEqual(code, 1)
+        self.assertNotIn("started dispatchd", out)
+        self.assertIn("exited immediately", err)
+        self.assertIn("ModuleNotFoundError", err)
+        self.assertEqual(len([c for c in calls if c[:2] == ["tmux", "new-session"]]), 1)
+
+    def test_up_says_so_when_a_dead_launch_left_nothing_behind(self):
+        runner, _ = self._runner(alive=False, survives=False)
+        code, _, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertEqual(code, 1)
+        self.assertIn("dispatch run", err)
+
+    def test_up_warns_when_there_is_no_bot_token(self):
+        """Without one the daemon runs with no chat transport at all, which
+        after the cutover means no interface at all."""
+        runner, _ = self._runner(alive=False)
+        code, out, err = self._capture(
+            cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertEqual(code, 0)
+        self.assertIn("started dispatchd", out)
+        self.assertIn("no bot token", err)
+
+    def test_up_is_quiet_about_the_token_when_there_is_one(self):
+        token = os.path.join(self.tmp.name, "token.env")
+        with open(token, "w") as fh:
+            fh.write("TELEGRAM_BOT_TOKEN=123456:not-a-real-token\n")
+        with mock.patch.dict(os.environ, {"DISPATCH_TOKEN_ENV": token}):
+            runner, _ = self._runner(alive=False)
+            code, _, err = self._capture(
+                cli.cmd_up, _Args(if_dead=False, runner=runner, settle=0))
+        self.assertEqual(code, 0)
+        self.assertNotIn("bot token", err)
+
+    def test_logs_daemon_falls_back_to_the_daemon_log(self):
+        """`capture-pane` reads the live pane, so it can never say why the
+        previous daemon died -- and that is the case you need a log for."""
+        config_mod.ensure_dirs()
+        with open(config_mod.daemon_log_path(), "w") as fh:
+            fh.write("tick failed at 2026-08-20 09:00:00\nRuntimeError: kaboom\n")
+
+        def runner(argv, **kwargs):
+            class Result:
+                returncode = 1
+                stdout = ""
+                stderr = "can't find session: dispatchd"
+            return Result()
+
+        code, out, err = self._capture(cli.cmd_logs, _Args(daemon=True, id=None,
+                                                           runner=runner))
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("kaboom", out)
+        self.assertIn(config_mod.daemon_log_path(), out)
+
+    def test_logs_daemon_falls_back_when_the_pane_is_empty(self):
+        config_mod.ensure_dirs()
+        with open(config_mod.daemon_log_path(), "w") as fh:
+            fh.write("tick failed at 2026-08-20 09:00:00\nRuntimeError: kaboom\n")
+        runner, _ = self._runner(alive=True, stdout="   \n")
+        code, out, _ = self._capture(cli.cmd_logs, _Args(daemon=True, id=None,
+                                                         runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn("kaboom", out)
+
+    def test_logs_daemon_still_prefers_the_live_pane(self):
+        config_mod.ensure_dirs()
+        with open(config_mod.daemon_log_path(), "w") as fh:
+            fh.write("an old crash\n")
+        runner, _ = self._runner(alive=True, stdout="daemon says hello")
+        code, out, _ = self._capture(cli.cmd_logs, _Args(daemon=True, id=None,
+                                                         runner=runner))
+        self.assertEqual(code, 0)
+        self.assertIn("daemon says hello", out)
+        self.assertNotIn("an old crash", out)
 
     def test_the_parser_wires_up_down_and_logs_daemon(self):
         parser_ = cli.build_parser()
@@ -2258,6 +2787,46 @@ class TestCliSetup(_CliEnv):
             self.assertTrue(json.load(fh)["enabledPlugins"][cli.PLUGIN_KEY])
         self.assertFalse(os.path.exists(path + ".bak"))
 
+    LIST_FORM = ('{"enabledPlugins": ["telegram@claude-plugins-official", '
+                 '"superpowers@claude-plugins-official"]}')
+
+    def test_the_reader_and_the_writer_agree_on_both_shapes(self):
+        """`_plugin_enabled` read the list form and `disable_plugin` refused
+        it, so a genuinely enabled plugin was reported as impossible to turn
+        off -- and setup said "do it by hand" about something it could do."""
+        for text in (self.ORIGINAL, self.LIST_FORM):
+            path = self._settings(text)
+            self.assertTrue(cli._plugin_enabled(path), text)
+            self.assertIsNotNone(cli.disable_plugin(path), text)
+            self.assertFalse(cli._plugin_enabled(path), text)
+            os.unlink(path + ".bak")
+
+    def test_the_list_form_loses_only_that_entry(self):
+        path = self._settings(self.LIST_FORM)
+        cli.disable_plugin(path)
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["enabledPlugins"],
+                             ["superpowers@claude-plugins-official"])
+
+    def test_the_list_form_is_a_noop_when_the_plugin_is_not_in_it(self):
+        path = self._settings('{"enabledPlugins": ["superpowers@claude-plugins-official"]}')
+        self.assertIsNone(cli.disable_plugin(path))
+        self.assertFalse(os.path.exists(path + ".bak"))
+
+    def test_setup_exits_non_zero_when_the_plugin_is_still_enabled(self):
+        """One token admits one consumer. Leaving the plugin on guarantees the
+        409 this command exists to prevent, and a scripted cutover reads the
+        exit status, not the stderr line."""
+        path = self._settings()
+        with mock.patch.object(cli, "disable_plugin", return_value=None):
+            code, out, err = self._capture(cli.cmd_setup, _Args(
+                settings=path, keep_plugin=False, repo=None, chat=["7256243815"]))
+        self.assertEqual(code, 1)
+        self.assertIn("still enabled", err)
+        self.assertNotIn("dispatch up", out)
+        # Everything else it does still happened; only the verdict changed.
+        self.assertEqual(config_mod.load()["chat_allowlist"], ["7256243815"])
+
     def test_the_setup_parser_swaps_force_for_keep_plugin(self):
         """Parser wiring only. That `setup` actually disables the plugin is
         `test_setup_disables_the_plugin_and_writes_config`'s job."""
@@ -2266,6 +2835,366 @@ class TestCliSetup(_CliEnv):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser_.parse_args(["setup", "--force"])
+
+
+class TestCliAdd(_CliEnv):
+    """`dispatch add` is the only way to queue work when Telegram is down.
+
+    It resolved against the hand-configured alias map, which `setup` no longer
+    populates, so it refused every repo the daemon happily accepts from chat.
+    There was no test for it at all -- which is how it survived the branch.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.projects = os.path.join(self.tmp.name, "Projects")
+        os.makedirs(os.path.join(self.projects, "qpay", ".git"))
+        os.makedirs(os.path.join(self.projects, "notes"))  # a folder, not a repo
+        self._config()
+
+    def _config(self, **over):
+        cfg = {"projects_root": self.projects}
+        cfg.update(over)
+        state.write(config_mod.config_path(), cfg)
+
+    def _args(self, **over):
+        base = dict(repo="qpay", prompt="do the thing", priority=5, dep=None,
+                    worktree=False, agent=lanes.CLAUDE)
+        base.update(over)
+        return _Args(**base)
+
+    def test_add_queues_a_discovered_repo(self):
+        code, out, err = self._capture(cli.cmd_add, self._args())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("t-0001", out)
+        task = state.read_queue()["tasks"][0]
+        self.assertEqual((task["repo"], task["prompt"]), ("qpay", "do the thing"))
+
+    def test_add_refuses_a_folder_that_is_not_a_repo(self):
+        code, out, err = self._capture(cli.cmd_add, self._args(repo="notes"))
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("not dispatchable", err)
+        self.assertEqual(state.read_queue()["tasks"], [])
+
+    def test_add_refuses_an_unknown_repo_the_way_the_daemon_does(self):
+        """One resolver, one rejection message -- the CLI must not have its own."""
+        code, _, err = self._capture(cli.cmd_add, self._args(repo="nope"))
+        self.assertEqual(code, 2)
+        found = repos.discover(root=self.projects)
+        self.assertIn(repos.reject_reason("nope", found), err)
+        self.assertIn("qpay", err)
+
+    def test_add_honours_a_configured_override_outside_the_root(self):
+        outside = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(os.path.join(outside, ".git"))
+        self._config(repos={"elsewhere": outside})
+        code, _, err = self._capture(cli.cmd_add, self._args(repo="elsewhere"))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(state.read_queue()["tasks"][0]["repo"], "elsewhere")
+
+    def test_add_still_carries_priority_deps_and_isolation(self):
+        self._capture(cli.cmd_add, self._args())
+        self._capture(cli.cmd_add, self._args(priority=1, dep=["t-0001"],
+                                              worktree=True))
+        task = state.read_queue()["tasks"][1]
+        self.assertEqual(task["priority"], 1)
+        self.assertEqual(task["deps"], ["t-0001"])
+        self.assertEqual(task["isolation"], "worktree")
+
+    def test_add_puts_the_task_in_the_named_lane(self):
+        self._capture(cli.cmd_add, self._args(agent=lanes.CODEX))
+        self.assertEqual(state.read_queue()["tasks"][0]["agent"], lanes.CODEX)
+
+    def test_add_defaults_to_the_claude_lane(self):
+        self._capture(cli.cmd_add, self._args())
+        self.assertEqual(state.read_queue()["tasks"][0]["agent"], lanes.CLAUDE)
+
+    def test_the_add_parser_wires_the_lane_flag(self):
+        parser_ = cli.build_parser()
+        self.assertEqual(parser_.parse_args(["add", "qpay", "x"]).agent, lanes.CLAUDE)
+        self.assertEqual(
+            parser_.parse_args(["add", "qpay", "x", "--agent", "codex"]).agent,
+            lanes.CODEX)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser_.parse_args(["add", "qpay", "x", "--agent", "gemini"])
+
+
+class TestWeekWindow(unittest.TestCase):
+    """The week window and the wind-down machine used to disagree.
+
+    `admit` refuses at `week_pct >= week_soft`; `next_mode` never looked at the
+    week at all. A lane at 100% of its weekly window therefore reported
+    `running` -- which the user is told to read as "dispatching normally" --
+    and dispatched nothing, forever, with no reason given anywhere.
+    """
+
+    def test_a_full_week_window_freezes_an_idle_lane(self):
+        self.assertEqual(
+            winddown.next_mode("running", 3.0, 0, CONFIG, week_pct=100.0),
+            winddown.FROZEN)
+
+    def test_a_full_week_window_drains_in_flight_work_first(self):
+        self.assertEqual(
+            winddown.next_mode("running", 3.0, 1, CONFIG, week_pct=100.0),
+            winddown.WINDING_DOWN)
+
+    def test_below_the_week_soft_limit_nothing_changes(self):
+        self.assertEqual(
+            winddown.next_mode("running", 3.0, 0, CONFIG, week_pct=89.9),
+            winddown.RUNNING)
+
+    def test_the_boundary_is_the_same_one_admission_uses(self):
+        soft = CONFIG["week_soft"]
+        self.assertEqual(winddown.next_mode("running", 3.0, 0, CONFIG,
+                                            week_pct=soft), winddown.FROZEN)
+        ok, _ = scheduler.admit(
+            {"id": "t-0001", "repo": "demo", "state": "queued", "priority": 5,
+             "deps": [], "isolation": "repo"},
+            {"mode": "running", "queue": {"tasks": []}, "running": 0,
+             "session_pct": 3.0, "week_pct": soft, "stale": False,
+             "est_cost_pct": 1.0, "config": CONFIG, "lock_free": lambda n: True})
+        self.assertFalse(ok)
+
+    def test_a_pause_still_outranks_the_week_window(self):
+        self.assertEqual(
+            winddown.next_mode(winddown.PAUSED, 3.0, 0, CONFIG, week_pct=100.0),
+            winddown.PAUSED)
+
+    def test_an_unknown_week_reading_changes_nothing(self):
+        self.assertEqual(
+            winddown.next_mode("running", 3.0, 0, CONFIG, week_pct=None),
+            winddown.RUNNING)
+
+    def test_a_confirmed_session_reset_does_not_resume_a_week_frozen_lane(self):
+        """Otherwise the lane resumes and re-freezes on every tick, and the
+        user gets a freeze notice per tick until the week rolls over."""
+        doc = {"mode": winddown.FROZEN, "armed_resume_at": 5060.0}
+        ok, why = winddown.can_resume(doc, 3.0, 5100.0, CONFIG, False,
+                                      week_pct=100.0)
+        self.assertFalse(ok)
+        self.assertIn("week", why)
+        self.assertTrue(winddown.can_resume(doc, 3.0, 5100.0, CONFIG, False,
+                                            week_pct=10.0)[0])
+
+    def test_a_freeze_waits_for_whichever_window_is_actually_full(self):
+        reading = {"session_pct": 3.0, "week_pct": 100.0,
+                   "resets_at": 5000.0, "week_resets_at": 900000.0}
+        self.assertEqual(winddown.binding_reset(reading, CONFIG), 900000.0)
+        self.assertEqual(
+            winddown.binding_reset(dict(reading, week_pct=1.0), CONFIG), 5000.0)
+
+    def test_a_lane_with_no_session_reading_does_not_report_zero_percent(self):
+        """`session 0%` reads as an empty window; it meant "no reading at all"."""
+        line = governor.pct_line({"session_pct": 0.0, "session_known": False,
+                                  "week_pct": 100.0, "source": "codex-unknown"})
+        self.assertNotIn("session 0%", line)
+        self.assertIn("week 100%", line)
+        self.assertIn("session", line)
+
+    def test_a_real_zero_still_reads_as_zero(self):
+        self.assertIn("session 0%", governor.pct_line(
+            {"session_pct": 0.0, "week_pct": 1.0, "source": "measured"}))
+
+    def test_the_codex_estimate_says_whether_it_read_a_session_percentage(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        now = 1_800_000_000.0
+        directory = os.path.join(tmp.name, "sessions")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "a.jsonl"), "w") as fh:
+            fh.write(json.dumps({"payload": {"info": {"rate_limits": {
+                "primary": {"used_percent": 100.0, "window_minutes": 10080,
+                            "resets_at": now + 86400}}}}}) + "\n")
+        estimate = governor.codex.estimate(now, root=directory)
+        # A week-only record: the session percentage is absent, not zero.
+        self.assertEqual(estimate["session_pct"], 0.0)
+        self.assertFalse(estimate["session_known"])
+        self.assertEqual(estimate["week_resets_at"], now + 86400)
+        self.assertNotIn("session 0%", governor.pct_line(estimate))
+        self.assertFalse(governor.codex.estimate(
+            now, root=os.path.join(tmp.name, "nothing"))["session_known"])
+
+
+class _StepProcess:
+    """A step that either writes a status file or dies without writing one."""
+
+    def __init__(self, task_dir, block=None, hangs=False):
+        self.task_dir = task_dir
+        self.block = block
+        self.hangs = hangs
+        self.returncode = 0
+        self.signals = []
+
+    def _write(self):
+        if self.block is None:
+            return
+        with open(os.path.join(self.task_dir, "last.json"), "w") as fh:
+            json.dump(self.block, fh)
+
+    def communicate(self, timeout=None):
+        if self.hangs and not self.signals:
+            raise subprocess.TimeoutExpired("codex", timeout or 0)
+        self._write()
+        return "", None
+
+    def send_signal(self, signal_number):
+        self.signals.append(signal_number)
+
+    def kill(self):
+        self.signals.append("kill")
+        self.returncode = -9
+
+    def poll(self):
+        # Ignores SIGTERM, so the grace period expires and SIGKILL follows.
+        return self.returncode if "kill" in self.signals else None
+
+
+class _Response:
+    """The shape ``urlopen`` returns: a context manager over bytes."""
+
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+class TestChatTransportHealth(unittest.TestCase):
+    """Every transport failure used to return `[], offset` and say nothing.
+
+    After the cutover Telegram is the only interface, and its total failure is
+    indistinguishable from nobody sending anything: the daemon is up, the queue
+    is healthy, the watchdog is quiet, and the bot answers nothing.
+    """
+
+    TOKEN = "123456:SECRET-BOT-TOKEN"
+
+    def _chat(self, opener):
+        from dispatch import chat as chat_mod
+        return chat_mod.Chat(self.TOKEN, opener=opener)
+
+    def test_a_failed_poll_is_counted_and_its_reason_kept(self):
+        chat = self._chat(mock.Mock(side_effect=OSError("connection refused")))
+        self.assertEqual(chat.poll(7), ([], 7))
+        self.assertEqual(chat.failures, 1)
+        chat.poll(7)
+        self.assertEqual(chat.failures, 2)
+        self.assertIn("connection refused", chat.last_error)
+
+    def test_a_working_poll_clears_the_record(self):
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("connection refused")
+            return _Response({"result": []})
+
+        chat = self._chat(opener)
+        chat.poll(0)
+        self.assertEqual(chat.failures, 1)
+        self.assertEqual(chat.poll(0), ([], 0))
+        self.assertEqual(chat.failures, 0)
+        self.assertIsNone(chat.last_error)
+
+    def test_the_token_never_reaches_the_recorded_error(self):
+        """`chat_last_error` is written to state.json, and the token is never
+        copied there."""
+        chat = self._chat(mock.Mock(side_effect=OSError(
+            "HTTP Error 409 for https://api.telegram.org/bot%s/getUpdates"
+            % TestChatTransportHealth.TOKEN)))
+        chat.poll(0)
+        self.assertNotIn("SECRET-BOT-TOKEN", chat.last_error)
+        self.assertIn("<token>", chat.last_error)
+
+    def test_a_failed_send_counts_too(self):
+        chat = self._chat(mock.Mock(side_effect=OSError("timed out")))
+        self.assertFalse(chat.send("1", "hello"))
+        self.assertEqual(chat.failures, 1)
+
+    def test_the_null_transport_carries_the_reason_there_is_no_transport(self):
+        from dispatch import chat as chat_mod
+        self.assertIsNone(chat_mod.NullChat().last_error)
+        offline = chat_mod.NullChat(reason="no bot token at /nowhere")
+        self.assertIn("no bot token", offline.last_error)
+        self.assertEqual(offline.failures, 0)
+        self.assertEqual(offline.poll(3), ([], 3))
+        self.assertIn("no bot token", offline.last_error)
+
+
+class TestStepStatusIsNotInherited(unittest.TestCase):
+    """A step that dies must not settle as the previous step's success.
+
+    The codex backend reads its status from ``task_dir/last.json``, written by
+    ``codex -o``. Nothing cleared it between steps, so a step SIGKILLed at
+    ``step_timeout`` read the *previous* step's block: status ``continue``,
+    requeued, ``steps_done`` incremented, and a checkpoint commit labelled with
+    a summary describing work this step never did. There is no step cap
+    anywhere, so that loops for as long as the plan window allows.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.task = {"id": "t-0001", "repo": "qpay", "prompt": "do a thing",
+                     "branch": "tg/t-0001", "agent": "codex", "session_id": None}
+
+    def _stale(self):
+        with open(os.path.join(self.tmp.name, "last.json"), "w") as fh:
+            json.dump({"status": "continue", "summary": "step one did the schema",
+                       "next": "wire it up"}, fh)
+
+    def _run(self, block=None, hangs=False):
+        process = _StepProcess(self.tmp.name, block=block, hangs=hangs)
+        result = worker.run_step(self.task, self.tmp.name, CONFIG,
+                                 popen=lambda argv, **kwargs: process,
+                                 sleeper=lambda seconds: None,
+                                 task_dir=self.tmp.name)
+        return result, process
+
+    def test_a_killed_step_does_not_inherit_the_previous_summary(self):
+        self._stale()
+        result, process = self._run(hangs=True)
+        self.assertTrue(result["timed_out"])
+        self.assertIn("kill", process.signals)
+        self.assertIsNone(result["status"])
+        self.assertEqual(result["summary"], "")
+
+    def test_a_step_that_writes_nothing_reports_nothing(self):
+        self._stale()
+        result, _ = self._run()
+        self.assertIsNone(result["status"])
+
+    def test_a_step_that_writes_its_own_status_still_settles(self):
+        self._stale()
+        result, _ = self._run(block={"status": "complete", "summary": "this step",
+                                     "next": ""})
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["summary"], "this step")
+
+    def test_clearing_is_safe_when_there_is_nothing_to_clear(self):
+        result, _ = self._run(block={"status": "complete", "summary": "first",
+                                     "next": ""})
+        self.assertEqual(result["status"], "complete")
+
+    def test_a_claude_step_is_unaffected(self):
+        """Claude reports in its stdout, so there is nothing to clear."""
+        task = dict(self.task, agent="claude")
+        process = _StepProcess(self.tmp.name)
+        process.communicate = lambda timeout=None: (
+            '```json\n{"status": "complete", "summary": "ok"}\n```', None)
+        result = worker.run_step(task, self.tmp.name, CONFIG,
+                                 popen=lambda argv, **kwargs: process,
+                                 task_dir=self.tmp.name)
+        self.assertEqual(result["status"], "complete")
 
 
 if __name__ == "__main__":

@@ -134,17 +134,25 @@ def estimate(now, root=None, scan_limit=SCAN_LIMIT):
     ``stale`` is always False. See the module docstring: absence of a reading
     is not a reason to block, because running codex is the only thing that
     produces one.
+
+    A missing session percentage becomes ``0.0`` so admission arithmetic has a
+    number to work with, and ``session_known`` records that it was substituted.
+    Without that flag every surface renders "no reading at all" as "an empty
+    window", which is the more encouraging of the two and the wrong one.
     """
     current = reading(now, root=root, scan_limit=scan_limit)
     if not current["ok"]:
-        return {"session_pct": 0.0, "week_pct": None, "source": "codex-unknown",
-                "stale": False, "resets_at": None}
+        return {"session_pct": 0.0, "session_known": False, "week_pct": None,
+                "source": "codex-unknown", "stale": False,
+                "resets_at": None, "week_resets_at": None}
     return {
         "session_pct": current["session_pct"] if current["session_pct"] is not None else 0.0,
+        "session_known": current["session_pct"] is not None,
         "week_pct": current["week_pct"],
         "source": "codex-logs",
         "stale": False,
         "resets_at": current["session_reset"] or current["week_reset"],
+        "week_resets_at": current["week_reset"],
     }
 
 

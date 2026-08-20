@@ -37,8 +37,27 @@ VALID = ("complete", "continue", "blocked")
 SESSION_KEYS = ("thread_id", "session_id", "conversation_id")
 
 
+STATUS_FILE = "last.json"
+
+
 def house_rules(task):
     return HOUSE_RULES.format(branch=task["branch"]).strip()
+
+
+def reset(task_dir):
+    """Drop the previous step's status file before a new step starts.
+
+    ``-o`` overwrites this file when codex finishes normally and leaves it
+    untouched when the process dies -- at ``step_timeout``, on SIGKILL, on a
+    crash. Nothing else cleared it, so a dead step read the *previous* step's
+    block and settled as that step's success: requeued with an incremented
+    ``steps_done`` and a checkpoint commit labelled with a summary describing
+    work it never did. With no step cap anywhere, that repeats.
+    """
+    try:
+        os.unlink(os.path.join(task_dir, STATUS_FILE))
+    except OSError:
+        pass
 
 
 def resume_args(session_id):
@@ -55,7 +74,7 @@ def build_command(task, prompt_path, cwd, task_dir, unsafe=True):
         "-C", cwd,
         "--skip-git-repo-check",
         "--output-schema", SCHEMA_PATH,
-        "-o", os.path.join(task_dir, "last.json"),
+        "-o", os.path.join(task_dir, STATUS_FILE),
     ])
     if unsafe:
         argv.append("--dangerously-bypass-approvals-and-sandbox")
@@ -83,7 +102,7 @@ def _session_id(output):
 def parse_result(output, task_dir):
     session_id = _session_id(output)
     try:
-        with open(os.path.join(task_dir, "last.json")) as fh:
+        with open(os.path.join(task_dir, STATUS_FILE)) as fh:
             block = json.load(fh)
     except (OSError, ValueError):
         return {"status": None, "summary": "", "next": "", "session_id": session_id}

@@ -53,6 +53,16 @@ def state_path():
     return path("state.json")
 
 
+def daemon_log_path():
+    """Where the daemon appends what the tmux pane cannot keep.
+
+    ``logs --daemon`` captures the *live* pane, so it can never show why the
+    previous daemon died -- and a daemon that dies takes its session, and its
+    scrollback, with it. This file outlives both.
+    """
+    return path("daemon.log")
+
+
 def lock_path(name):
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
     return path("locks", safe + ".lock")

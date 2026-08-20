@@ -28,6 +28,11 @@ def house_rules(task):
     return HOUSE_RULES.format(branch=task["branch"]).strip()
 
 
+def reset(task_dir):
+    """Nothing to clear: the status arrives in this step's own stdout."""
+    return None
+
+
 def resume_args(session_id):
     """Claude continues with an option pair."""
     return ["--resume", session_id] if session_id else []

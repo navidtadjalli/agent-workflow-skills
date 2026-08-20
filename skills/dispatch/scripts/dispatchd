@@ -2,12 +2,43 @@
 """Daemon entrypoint. Runs the tick loop in the foreground, under tmux."""
 import os
 import sys
+import time
+import traceback
 
 # realpath, not abspath: these scripts get symlinked into place, and abspath
 # would insert the symlink's own directory instead of the package's.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from dispatch.cli import main  # noqa: E402
+
+def _fatal(text):
+    """Record a death the tmux pane cannot keep.
+
+    With `remain-on-exit off` the pane, and the whole session, goes the instant
+    this process does -- so `dispatch up` and `dispatch logs --daemon` have
+    nothing left to read. A startup failure never reaches the tick loop's own
+    guard either, and it is exactly the failure that makes `up` report a
+    session that is already gone.
+    """
+    body = "dispatchd died at %s\n%s\n" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), text)
+    sys.stderr.write(body)
+    try:
+        from dispatch import config
+
+        config.ensure_dirs()
+        with open(config.daemon_log_path(), "a") as fh:
+            fh.write(body)
+    except Exception:  # noqa: BLE001 - already dying; stderr has it either way
+        pass
+
 
 if __name__ == "__main__":
-    sys.exit(main(["run"] + sys.argv[1:]))
+    try:
+        from dispatch.cli import main
+
+        sys.exit(main(["run"] + sys.argv[1:]))
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:
+        _fatal(traceback.format_exc())
+        sys.exit(1)

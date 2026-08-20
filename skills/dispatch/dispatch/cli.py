@@ -17,7 +17,7 @@ import time
 
 from . import config as config_mod
 from . import daemon as daemon_mod
-from . import governor, lanes, state, usage
+from . import governor, lanes, repos, state, usage, volume
 
 PLUGIN_KEY = "telegram@claude-plugins-official"
 TMUX_SESSION = "dispatchd"
@@ -52,8 +52,16 @@ def cmd_status(args):
         if armed:
             print("        %s resume armed %s" % (
                 lane, time.strftime("%Y-%m-%d %H:%M", time.localtime(armed))))
+        hold = daemon_mod.hold_line(doc, lane, doc["mode"][lane])
+        if hold:
+            print(hold)
     print("queue   %s" % (" ".join("%s %d" % kv for kv in sorted(counts.items()))
                           or "empty"))
+    chat_line = daemon_mod.chat_status_line(doc)
+    if chat_line:
+        # The one thing this surface can report that the chat one cannot: if
+        # the transport is down, its own status reply never arrives.
+        print(chat_line)
     return 0
 
 
@@ -76,17 +84,24 @@ def cmd_queue(args):
 
 
 def cmd_add(args):
+    """Queue a task, resolving the repo exactly the way the daemon does.
+
+    Through ``repos``, not through ``cfg["repos"]``: the alias map was retired
+    when discovery landed and ``setup`` leaves it empty, so resolving against it
+    refused every repo the daemon accepts from chat -- and this command is the
+    fallback for when chat is the thing that is down.
+    """
     cfg = config_mod.load()
-    repos = cfg.get("repos") or {}
-    if args.repo not in repos:
-        print("unknown repo '%s' · configured: %s" % (
-            args.repo, ", ".join(sorted(repos)) or "none"), file=sys.stderr)
+    found = repos.discover(root=repos.root_path(cfg), overrides=cfg.get("repos"))
+    if repos.resolve(args.repo, found=found) is None:
+        print(repos.reject_reason(args.repo, found), file=sys.stderr)
         return 2
     with state.mutate_queue() as queue:
         task = state.new_task(queue, args.repo, args.prompt,
                               priority=args.priority,
                               deps=args.dep or [],
-                              isolation="worktree" if args.worktree else "repo")
+                              isolation="worktree" if args.worktree else "repo",
+                              agent=getattr(args, "agent", None) or lanes.CLAUDE)
     print(task["id"])
     return 0
 
@@ -122,14 +137,23 @@ def cmd_logs(args):
     if getattr(args, "daemon", False):
         result = _tmux(["capture-pane", "-pt", TMUX_SESSION],
                        getattr(args, "runner", None))
-        if result.returncode != 0:
-            detail = (result.stderr or "").strip()
-            print("no output from tmux session '%s'%s"
-                  % (TMUX_SESSION, " · " + detail if detail else ""),
-                  file=sys.stderr)
-            return 2
-        sys.stdout.write(result.stdout)
-        return 0
+        if result.returncode == 0 and (result.stdout or "").strip():
+            sys.stdout.write(result.stdout)
+            return 0
+        # `capture-pane` reads the *live* pane, so it can never say why the
+        # previous daemon died -- and the case you most want a log for is
+        # exactly the one where there is no pane left to read.
+        log = _daemon_log_tail()
+        if log:
+            print("%s:" % config_mod.daemon_log_path())
+            print(log)
+            return 0
+        detail = (result.stderr or "").strip()
+        print("no output from tmux session '%s'%s · nothing in %s either"
+              % (TMUX_SESSION, " · " + detail if detail else "",
+                 config_mod.daemon_log_path()),
+              file=sys.stderr)
+        return 2
     if not args.id:
         print("logs needs a task id, or --daemon", file=sys.stderr)
         return 2
@@ -145,6 +169,11 @@ def cmd_logs(args):
 
 
 def cmd_usage(args):
+    """Both lanes and the volume report, the same composition chat gets.
+
+    Reporting only the Claude lane here meant the terminal fallback could not
+    answer the question the codex lane's own wind-down turns on.
+    """
     doc, snapshot, tokens, now = _snapshot()
     if args.poll:
         reading = usage.poll(now=now)
@@ -154,7 +183,19 @@ def cmd_usage(args):
         snapshot = governor.record_poll(snapshot, reading, tokens)
         with state.mutate_state() as live:
             live["governor"] = snapshot
-    print(governor.summary(snapshot, now, tokens))
+    print("CLAUDE  %s" % governor.summary(snapshot, now, tokens))
+    polled_at = snapshot.get("polled_at")
+    if polled_at:
+        print("        last real poll %dm ago" % ((now - polled_at) // 60))
+    print("CODEX   %s" % governor.pct_line(governor.codex.estimate(now)))
+    print()
+    try:
+        # Explicit roots: `volume` defaults to the home directory it was ported
+        # from, and every other root this CLI reads is configurable.
+        print(volume.render(now, claude_root=config_mod.transcripts_root(),
+                            codex_root=config_mod.codex_sessions_root()))
+    except Exception as exc:  # noqa: BLE001 - a bad log must not hide the rest
+        print("volume report unavailable: %s" % exc, file=sys.stderr)
     return 0
 
 
@@ -250,6 +291,16 @@ def cmd_up(args):
     if result.returncode != 0:
         print("failed to start: %s" % (result.stderr or "").strip(), file=sys.stderr)
         return 1
+    if not _survived(runner, getattr(args, "settle", 1.0)):
+        # `new-session` returns 0 the moment the session exists. With the
+        # default `remain-on-exit off`, a daemon that dies during startup takes
+        # the session with it milliseconds later -- and `up` would report
+        # success, the watchdog would find nothing to do five minutes later,
+        # and the traceback would have gone down with the pane.
+        print("failed to start: dispatchd exited immediately", file=sys.stderr)
+        for line in _startup_diagnostics(runner):
+            print(line, file=sys.stderr)
+        return 1
     print("started dispatchd in tmux session '%s'" % TMUX_SESSION)
     missing = [agent for agent in AGENTS
                if shutil.which(agent, path=daemon_path()) is None]
@@ -259,7 +310,51 @@ def cmd_up(args):
         # failure that looks like success, so it is said out loud.
         print("warning: %s not on the daemon's PATH; that lane will fail with "
               "command-not-found" % ", ".join(missing), file=sys.stderr)
+    if config_mod.read_token() is None:
+        # Same shape as the missing-agent warning, and worse in kind: without a
+        # token the daemon runs with no chat transport at all, which after the
+        # cutover means no interface at all.
+        print("warning: no bot token at %s; the daemon will run with no chat "
+              "transport" % config_mod.token_env_path(), file=sys.stderr)
     return 0
+
+
+def _survived(runner, settle):
+    """Whether the session is still there a moment after it was created."""
+    if settle:
+        time.sleep(settle)
+    return session_alive(runner)
+
+
+def _startup_diagnostics(runner, limit=2000):
+    """Whatever the dead launch left behind: the pane, then the daemon log.
+
+    The pane is usually gone with the session, which is exactly why the daemon
+    writes its own crash log; this reads both rather than assuming either.
+    """
+    lines = []
+    pane = _tmux(["capture-pane", "-pt", TMUX_SESSION], runner)
+    if pane.returncode == 0 and (pane.stdout or "").strip():
+        lines.append(pane.stdout.strip()[-limit:])
+    log = _daemon_log_tail(limit)
+    if log:
+        lines.append("%s:" % config_mod.daemon_log_path())
+        lines.append(log)
+    if not lines:
+        lines.append("no output captured · run `dispatch run` in the foreground "
+                     "to see the failure")
+    return lines
+
+
+def _daemon_log_tail(limit=4000):
+    """The end of the daemon's own log, or None when there is none."""
+    try:
+        with open(config_mod.daemon_log_path()) as fh:
+            body = fh.read()
+    except OSError:
+        return None
+    body = body.strip()
+    return body[-limit:] if body else None
 
 
 def cmd_down(args):
@@ -299,6 +394,23 @@ def _copy_mode(source, target):
         pass
 
 
+def _without_plugin(enabled):
+    """``enabledPlugins`` with this plugin off, or None if it was already off.
+
+    Both shapes are real: a dict of ``{key: bool}`` and a plain list of enabled
+    keys. ``_plugin_enabled`` reads both, so this has to write both -- handling
+    only the dict meant a genuinely enabled plugin was reported as impossible
+    to disable, which is the one path where setup says "turn it off by hand"
+    about something it could have turned off.
+    """
+    if isinstance(enabled, dict):
+        return dict(enabled, **{PLUGIN_KEY: False}) if enabled.get(PLUGIN_KEY) else None
+    if isinstance(enabled, list):
+        return ([key for key in enabled if key != PLUGIN_KEY]
+                if PLUGIN_KEY in enabled else None)
+    return None
+
+
 def disable_plugin(settings_path):
     """Turn the conflicting chat plugin off. Returns the backup path, or None.
 
@@ -323,8 +435,8 @@ def disable_plugin(settings_path):
         return None
     if not isinstance(settings, dict):
         return None
-    enabled = settings.get("enabledPlugins")
-    if not isinstance(enabled, dict) or not enabled.get(PLUGIN_KEY):
+    disabled = _without_plugin(settings.get("enabledPlugins"))
+    if disabled is None:
         return None
 
     backup = settings_path + ".bak"
@@ -337,7 +449,7 @@ def disable_plugin(settings_path):
               % (settings_path, exc), file=sys.stderr)
         return None
 
-    enabled[PLUGIN_KEY] = False
+    settings["enabledPlugins"] = disabled
     target = os.path.realpath(settings_path)
     try:
         handle, temporary = tempfile.mkstemp(
@@ -372,6 +484,7 @@ def cmd_setup(args):
     config_mod.ensure_dirs()
     settings_path = args.settings or os.path.join(
         os.path.expanduser("~"), ".claude", "settings.json")
+    still_enabled = False
     if _plugin_enabled(settings_path):
         if args.keep_plugin:
             print("warning: %s is still enabled; two consumers of one bot get 409s"
@@ -382,20 +495,22 @@ def cmd_setup(args):
                 print("disabled %s in %s (backup: %s)"
                       % (PLUGIN_KEY, settings_path, backup))
             else:
+                still_enabled = True
                 print("could not disable %s in %s; turn it off by hand before "
                       "starting the daemon" % (PLUGIN_KEY, settings_path),
                       file=sys.stderr)
 
     cfg = config_mod.load()
     if args.repo:
-        repos = dict(cfg.get("repos") or {})
+        # `overrides`, not `repos`: that name is the discovery module here now.
+        overrides = dict(cfg.get("repos") or {})
         for entry in args.repo:
             alias, _, path = entry.partition("=")
             if not path:
                 print("repo must be alias=path, got: %s" % entry, file=sys.stderr)
                 return 2
-            repos[alias] = os.path.abspath(os.path.expanduser(path))
-        cfg["repos"] = repos
+            overrides[alias] = os.path.abspath(os.path.expanduser(path))
+        cfg["repos"] = overrides
     if args.chat:
         cfg["chat_allowlist"] = sorted(set((cfg.get("chat_allowlist") or []) + args.chat))
     state.write(config_mod.config_path(), cfg)
@@ -404,6 +519,17 @@ def cmd_setup(args):
     if config_mod.read_token() is None:
         print("warning: no bot token at %s; chat intake stays offline"
               % config_mod.token_env_path(), file=sys.stderr)
+
+    if still_enabled:
+        # Non-zero, though the config was written and everything else worked.
+        # One token admits exactly one consumer: with the plugin left enabled,
+        # `dispatch up` produces a daemon that 409s on every poll while every
+        # health surface stays green. A stderr line the operator may not be
+        # watching is not enough to stop a scripted cutover from continuing --
+        # an exit status is.
+        print("setup incomplete: %s is still enabled" % PLUGIN_KEY,
+              file=sys.stderr)
+        return 1
 
     print("start it with: dispatch up")
     return 0
@@ -426,6 +552,8 @@ def build_parser():
     add.add_argument("--priority", type=int, default=5)
     add.add_argument("--dep", action="append")
     add.add_argument("--worktree", action="store_true")
+    add.add_argument("--agent", choices=list(AGENTS), default=lanes.CLAUDE,
+                     help="which lane to queue into (default: claude)")
     add.set_defaults(func=cmd_add)
 
     cancel = subs.add_parser("cancel")

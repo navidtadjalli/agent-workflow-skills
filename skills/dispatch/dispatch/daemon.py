@@ -20,7 +20,9 @@ import concurrent.futures
 import json
 import os
 import subprocess
+import sys
 import time
+import traceback
 
 from . import chat as chat_mod
 from . import config as config_mod
@@ -29,6 +31,21 @@ from . import governor, lanes, parser, repos, scheduler, sessions, state, usage,
 PARSE_PROMPT = (
     "Convert this request into a JSON array of tasks. Each element must have "
     '"repo" (one of: %s) and "prompt". Reply with JSON only, no prose.\n\n%s')
+
+# How many times stored free-form text may be re-parsed before it is handed
+# back to the user. A parse that fails deterministically would otherwise be
+# retried on every tick, forever, at one request each.
+PARSE_ATTEMPTS = 3
+
+# Bytes of crash log kept before one rollover to `daemon.log.1`.
+DAEMON_LOG_MAX = 1_000_000
+
+
+def _clock_text(timestamp):
+    """A wall-clock time for a chat line, or None when there is none to give."""
+    if not timestamp:
+        return None
+    return time.strftime("%-I:%M%p", time.localtime(timestamp)).lower()
 
 
 class InlineExecutor:
@@ -67,6 +84,39 @@ def set_mode(verb, lane):
     return "resumed %s" % ", ".join(targets)
 
 
+def chat_status_line(state_doc):
+    """The ``chat`` row of a status report, or None when nothing is wrong.
+
+    Module level for the same reason ``set_mode`` is: `dispatch status` and the
+    chat `status` verb must not disagree about whether the chat surface is
+    working, and the copy that drifted would be the one the user reached for
+    when the other was down.
+    """
+    error = state_doc.get("chat_last_error")
+    if not error:
+        return None
+    parts = ["chat    %s" % error]
+    failures = state_doc.get("chat_failures") or 0
+    if failures:
+        parts.append("%d consecutive" % failures)
+    when = _clock_text(state_doc.get("chat_error_at"))
+    if when:
+        parts.append("last %s" % when)
+    return " · ".join(parts)
+
+
+def hold_line(state_doc, lane, mode):
+    """Why a lane that is ``running`` started nothing, if it started nothing.
+
+    Only for ``running``: every other mode explains itself. Shared by both
+    status surfaces for the same reason ``chat_status_line`` is.
+    """
+    if mode != winddown.RUNNING:
+        return None
+    reason = (state_doc.get("hold_reason") or {}).get(lane)
+    return "        holding: %s" % reason if reason else None
+
+
 class Daemon:
     def __init__(self, config=None, clock=None, poll_usage=None, count_tokens=None,
                  chat=None, run_step=None, executor=None, freeform=None,
@@ -92,9 +142,18 @@ class Daemon:
     # -- wiring defaults ---------------------------------------------------
 
     def _default_chat(self):
+        """The real transport, or a recorded reason why there is none.
+
+        Falling back to ``NullChat`` silently is the failure that looks most
+        like success: the daemon runs, the queue is healthy, the watchdog is
+        quiet, and the only interface the user has answers nothing.
+        """
         token = config_mod.read_token()
         if not token:
-            return chat_mod.NullChat()
+            reason = "no bot token at %s · chat intake offline" % (
+                config_mod.token_env_path())
+            print("warning: %s" % reason, file=sys.stderr)
+            return chat_mod.NullChat(reason=reason)
         return chat_mod.Chat(token, self.config.get("chat_allowlist"))
 
     def _default_run_step(self, task, cwd):
@@ -158,10 +217,7 @@ class Daemon:
             self.chat.send(chat_id, text)
 
     def _reset_text(self, reading):
-        resets = reading.get("resets_at")
-        if not resets:
-            return None
-        return time.strftime("%-I:%M%p", time.localtime(resets)).lower()
+        return _clock_text(reading.get("resets_at"))
 
     # -- the tick ----------------------------------------------------------
 
@@ -193,6 +249,10 @@ class Daemon:
         modes = self._apply_modes(snapshot, readings, now, tokens)
 
         self._intake(modes, readings, snapshot, now, tokens)
+        # Live mode rather than the tick's copy: intake may have just paused
+        # this lane, and a parse is a Claude request like any other.
+        if state.read_state()["mode"][lanes.CLAUDE] == winddown.RUNNING:
+            self.parse_pending(modes[lanes.CLAUDE], readings[lanes.CLAUDE])
         for lane in lanes.ALL:
             if modes[lane] == winddown.RUNNING:
                 self._dispatch(lane, readings[lane], now)
@@ -239,15 +299,17 @@ class Daemon:
         previous = doc["mode"][lane]
         summary = self._lane_summary(lane, doc.get("governor") or snapshot,
                                      reading, now, tokens)
+        week_pct = reading.get("week_pct")
         mode = winddown.next_mode(previous, reading["session_pct"], running,
-                                  self.config, reading["stale"])
+                                  self.config, reading["stale"], week_pct=week_pct)
 
         if mode == winddown.FROZEN and previous != winddown.FROZEN:
-            armed = winddown.resume_at(reading.get("resets_at"))
+            reset_at = winddown.binding_reset(reading, self.config)
+            armed = winddown.resume_at(reset_at)
             doc["armed_resume_at"][lane] = armed
             notices.append("%s frozen at %s · %s" % (
                 lane, summary,
-                "resumes ~%s" % self._reset_text(reading) if armed else
+                "resumes ~%s" % _clock_text(reset_at) if armed else
                 "resume not scheduled"))
 
         if mode == winddown.FROZEN:
@@ -256,12 +318,14 @@ class Daemon:
             # document they now live in.
             allowed, _ = winddown.can_resume(
                 {"mode": mode, "armed_resume_at": doc["armed_resume_at"][lane]},
-                reading["session_pct"], now, self.config, reading["stale"])
+                reading["session_pct"], now, self.config, reading["stale"],
+                week_pct=week_pct)
             if allowed:
                 mode = winddown.RUNNING
                 doc["armed_resume_at"][lane] = None
                 notices.append("%s resumed · %s" % (lane, summary))
             elif (lane == lanes.CLAUDE
+                  and not winddown.week_blocked(week_pct, self.config)
                   and doc["armed_resume_at"][lane]
                   and now >= doc["armed_resume_at"][lane]):
                 # The timer fired but the window has not actually rolled over.
@@ -270,6 +334,11 @@ class Daemon:
                 # codex reading, and a frozen codex lane's percentage cannot
                 # fall on its own, so this would re-arm forever and leak a
                 # request per poll_floor on the lane designed to be free.
+                #
+                # Not while the week is the binding limit either: that timer
+                # cannot be satisfied by anything a poll can say for days, and
+                # forcing one would spend a request every `poll_floor` for the
+                # whole of it. The idle cadence still refreshes the reading.
                 self._force_poll = True
         return mode
 
@@ -282,7 +351,11 @@ class Daemon:
         if lane == lanes.CLAUDE:
             return governor.summary(snapshot, now, tokens)
         parts = []
-        if reading.get("session_pct") is not None:
+        if reading.get("session_known") is False:
+            # Same distinction `governor.pct_line` draws: a substituted zero is
+            # "nobody has measured this", not "an empty window".
+            parts.append("5h --")
+        elif reading.get("session_pct") is not None:
             parts.append("5h %.0f%%" % reading["session_pct"])
         if reading.get("week_pct") is not None:
             parts.append("7d %.0f%%" % reading["week_pct"])
@@ -294,6 +367,7 @@ class Daemon:
     def _intake(self, modes, readings, snapshot, now, tokens):
         state_doc = state.read_state()
         messages, next_offset = self.chat.poll(state_doc.get("chat_offset", 0))
+        self._record_chat_health(now)
         if next_offset != state_doc.get("chat_offset", 0):
             with state.mutate_state() as doc:
                 doc["chat_offset"] = next_offset
@@ -302,6 +376,34 @@ class Daemon:
                                         now, tokens)
             if reply:
                 self.chat.send(message["chat_id"], reply)
+
+    def _record_chat_health(self, now):
+        """Publish the transport's condition where a working surface can read it.
+
+        Written only when it changes: the tick runs every few seconds and this
+        is the same value nearly every time. The stderr line lands in the tmux
+        pane, which is the one place a laptop-side look can find it when chat
+        itself is the thing that is down.
+        """
+        error = getattr(self.chat, "last_error", None)
+        failures = int(getattr(self.chat, "failures", 0) or 0)
+        current = state.read_state()
+        if (current.get("chat_last_error") == error
+                and current.get("chat_failures", 0) == failures):
+            return
+        with state.mutate_state() as doc:
+            doc["chat_last_error"] = error
+            doc["chat_failures"] = failures
+            doc["chat_error_at"] = now if error else None
+        if error:
+            # The count climbs on every tick of an outage; the message does not.
+            # Print on a new message and then at milestones, so the pane keeps
+            # showing the queue rather than one failure several times a minute.
+            if error != current.get("chat_last_error") or failures in (10, 100, 1000):
+                print("chat transport error (%d consecutive): %s"
+                      % (failures, error), file=sys.stderr)
+        elif current.get("chat_last_error"):
+            print("chat transport recovered", file=sys.stderr)
 
     def handle_command(self, text, modes, readings, snapshot, now, tokens):
         command = parser.parse(text)
@@ -378,7 +480,8 @@ class Daemon:
                 task = state.new_task(queue, "?", text)
                 task["state"] = "needs_parse"
                 task["last_error"] = error
-            return "stored %s · could not parse now (%s)" % (task["id"], error)
+            return "stored %s · could not parse now (%s) · retrying" % (
+                task["id"], error)
         ids = []
         for item in tasks:
             reply = self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
@@ -389,14 +492,38 @@ class Daemon:
                 return reply
         return "queued %s · %s" % (", ".join(ids), mode)
 
-    def parse_pending(self, mode, reading):
-        """Re-parse anything stored while the window was exhausted."""
-        pending = [t for t in state.read_queue()["tasks"] if t["state"] == "needs_parse"]
+    def parse_pending(self, mode, reading, limit=1):
+        """Re-parse anything stored while the window was exhausted.
+
+        Called once per tick from the loop, which is what makes "parsed after
+        reset" -- the reply the user is given -- true. It had no caller at all,
+        so stored text was stored and never looked at again.
+
+        One task per tick by default. The parse is a subprocess with a
+        two-minute cap and the tick is also what answers chat, so a backlog
+        must not be able to take the interface away for the length of it.
+
+        ``PARSE_ATTEMPTS`` bounds the retry. Without it a parse that fails the
+        same way every time -- no agent on PATH, a malformed request -- would
+        be retried every tick forever, spending a request each time on the lane
+        the storage existed to protect.
+        """
+        pending = [t for t in state.read_queue()["tasks"]
+                   if t["state"] == "needs_parse"][:limit]
         for task in pending:
             tasks, error = self.freeform(task["prompt"])
             if not tasks:
                 with state.mutate_queue() as queue:
-                    state.find(queue, task["id"])["last_error"] = error
+                    record = state.find(queue, task["id"])
+                    attempts = record.get("parse_attempts", 0) + 1
+                    record["parse_attempts"] = attempts
+                    record["last_error"] = error
+                    if attempts >= PARSE_ATTEMPTS:
+                        record["state"] = "blocked"
+                if attempts >= PARSE_ATTEMPTS:
+                    self.notify("%s blocked · could not parse it after %d "
+                                "attempts (%s) · send it again as `claude "
+                                "<task> on <repo>`" % (task["id"], attempts, error))
                 continue
             for item in tasks:
                 self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
@@ -478,14 +605,19 @@ class Daemon:
         counts = {}
         for task in queue["tasks"]:
             counts[task["state"]] = counts.get(task["state"], 0) + 1
-        lines = [
-            "claude  %s · %s" % (modes[lanes.CLAUDE],
-                                 governor.pct_line(readings[lanes.CLAUDE])),
-            "codex   %s · %s" % (modes[lanes.CODEX],
-                                 governor.pct_line(readings[lanes.CODEX])),
-            "queue   %s" % (" ".join("%s %d" % kv for kv in sorted(counts.items()))
-                            or "empty"),
-        ]
+        doc = state.read_state()
+        lines = []
+        for lane in lanes.ALL:
+            lines.append("%-7s %s · %s" % (lane, modes[lane],
+                                           governor.pct_line(readings[lane])))
+            hold = hold_line(doc, lane, modes[lane])
+            if hold:
+                lines.append(hold)
+        lines.append("queue   %s" % (
+            " ".join("%s %d" % kv for kv in sorted(counts.items())) or "empty"))
+        chat_line = chat_status_line(doc)
+        if chat_line:
+            lines.append(chat_line)
         return "\n".join(lines)
 
     def queue_line(self, limit=10):
@@ -521,16 +653,40 @@ class Daemon:
                 "est_cost_pct": 0.0,
             }
             candidate = None
+            blocked = None
             for task in scheduler.runnable(queue, lane):
                 ctx["est_cost_pct"] = governor.est_cost_pct(state_doc, task["repo"], self.config)
-                ok, _ = scheduler.admit(task, ctx)
+                ok, reason = scheduler.admit(task, ctx)
                 if ok:
                     candidate = task
                     break
+                if blocked is None:
+                    # `admit` says exactly why, and this was thrown away: a lane
+                    # reporting `running` with a queue that never moves is the
+                    # hardest state to diagnose from a chat window.
+                    blocked = "%s %s" % (task["id"], reason)
             if candidate is None:
+                self._record_hold(lane, blocked)
                 return
             if not self._start(candidate, now):
+                self._record_hold(lane, "%s %s is busy" % (
+                    candidate["id"], candidate["repo"]))
                 return
+
+    def _record_hold(self, lane, reason):
+        """Why this lane started nothing, for the status surfaces to repeat.
+
+        Written only when it changes, and read only while the lane is
+        ``running`` -- a hold is an explanation for the confusing case, not a
+        state anyone acts on.
+        """
+        current = (state.read_state().get("hold_reason") or {}).get(lane)
+        if current == reason:
+            return
+        with state.mutate_state() as doc:
+            holds = dict(doc.get("hold_reason") or {})
+            holds[lane] = reason
+            doc["hold_reason"] = holds
 
     def _start(self, task, now):
         cwd = self.repo_path(task["repo"])
@@ -608,7 +764,11 @@ class Daemon:
         summary = (result.get("summary") or "").strip()
         message = "%s step %d: %s" % (task_id, task.get("steps_done", 0) + 1,
                                       summary or "checkpoint")
-        self.checkpoint(task, entry["cwd"], message)
+        # `or {}` and `.get("ok", True)`: an injected checkpoint may report
+        # nothing, and silence from a seam is not evidence of failure.
+        committed = self.checkpoint(task, entry["cwd"], message) or {}
+        checkpoint_error = (None if committed.get("ok", True)
+                            else (committed.get("error") or "checkpoint failed"))
 
         directory = config_mod.task_dir(task_id)
         os.makedirs(directory, exist_ok=True)
@@ -620,6 +780,7 @@ class Daemon:
                 "at": self.clock(), "status": result.get("status"),
                 "summary": summary, "next": result.get("next"),
                 "timed_out": result.get("timed_out"),
+                "checkpoint_error": checkpoint_error,
             }) + "\n")
 
         with state.mutate_queue() as queue:
@@ -634,6 +795,14 @@ class Daemon:
             elif result.get("limit_reset_at"):
                 record["state"] = "paused"
                 record["last_error"] = "usage limit"
+            elif checkpoint_error:
+                # The step's own status is beside the point: nothing was
+                # committed, so `done` would name a branch with nothing on it
+                # and `queued` would run another step into the same failure.
+                # The wind-down contract is that work is parked, not lost --
+                # this is the one path where it was neither.
+                record["state"] = "failed"
+                record["last_error"] = "checkpoint failed: %s" % checkpoint_error
             else:
                 record["state"] = worker_next_state(result.get("status"), mode)
                 if record["state"] == "failed":
@@ -644,20 +813,55 @@ class Daemon:
             from . import worker as worker_mod
             worker_mod.write_handoff(directory, settled, result)
         if settled["state"] in ("done", "blocked", "failed", "cancelled"):
-            self.notify("%s [%s] %s · %s" % (task_id, lane, settled["state"],
-                                             summary or "-"))
+            self.notify("%s [%s] %s · %s" % (
+                task_id, lane, settled["state"],
+                ("not committed: %s" % checkpoint_error) if checkpoint_error
+                else (summary or "-")))
 
     # -- run loop ----------------------------------------------------------
 
     def run(self, interval=5, ticks=None, sleeper=None):
+        """The loop. A tick that raises is logged and the loop carries on.
+
+        An unhandled exception used to end the process; tmux then tore down the
+        session, and the traceback went with the pane. Nothing restarted it
+        until the watchdog's next five-minute pass, which would meet the same
+        deterministic error and die again -- a permanent lockout with no
+        diagnostics anywhere, on the only interface there is.
+        """
         sleeper = sleeper or time.sleep
         count = 0
         while ticks is None or count < ticks:
-            self.tick()
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 - one bad tick is not the daemon
+                self.log_crash(traceback.format_exc())
             count += 1
             if ticks is not None and count >= ticks:
                 break
             sleeper(interval)
+
+    def log_crash(self, text):
+        """Append a traceback to the daemon log, and to the pane while it lives.
+
+        Best effort in both directions: a daemon that cannot write its log must
+        still keep ticking.
+        """
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.clock()))
+        print("tick failed at %s\n%s" % (stamp, text), file=sys.stderr)
+        path = config_mod.daemon_log_path()
+        try:
+            config_mod.ensure_dirs()
+            # A tick that raises every interval would grow this without bound,
+            # and a full disk is a worse failure than the one being recorded.
+            # One rollover, keeping the newest: the first crash of a loop is
+            # the same as the ten-thousandth.
+            if os.path.exists(path) and os.path.getsize(path) > DAEMON_LOG_MAX:
+                os.replace(path, path + ".1")
+            with open(path, "a") as fh:
+                fh.write("tick failed at %s\n%s\n" % (stamp, text))
+        except OSError as exc:
+            print("could not write %s: %s" % (path, exc), file=sys.stderr)
 
 
 def worker_next_state(status, mode):

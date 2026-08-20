@@ -2,7 +2,17 @@
 
 Thin, deliberately: long-poll for updates, send text back. The daemon owns this
 socket exclusively -- two consumers polling the same bot get 409s from the API,
-which is why setup refuses to run while the in-session chat plugin is enabled.
+which is why setup disables the in-session chat plugin.
+
+A dropped poll is still not an error worth stopping for -- the next tick retries
+it -- but it stopped being invisible. Telegram is the only interface after the
+cutover, and its total failure looks exactly like silence: the daemon is up, the
+queue is healthy, the watchdog is quiet, and the bot answers nothing. So every
+failure is counted and its message kept, for the surfaces that are still
+reachable when this one is not.
+
+``last_error`` is redacted before it is exposed: it ends up in ``state.json``,
+and the bot token is never copied there.
 """
 import json
 import urllib.parse
@@ -17,6 +27,21 @@ class Chat:
         self.allowlist = [str(c) for c in (allowlist or [])]
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
+        # Health, for the surfaces that report on this one.
+        self.last_error = None
+        self.failures = 0
+
+    def _redact(self, text):
+        """The API URL carries the token; an error message may quote it."""
+        return text.replace(self._token, "<token>") if self._token else text
+
+    def _failed(self, exc):
+        self.failures += 1
+        self.last_error = self._redact("%s: %s" % (type(exc).__name__, exc))
+
+    def _worked(self):
+        self.failures = 0
+        self.last_error = None
 
     def _call(self, method, params):
         data = urllib.parse.urlencode(params).encode()
@@ -33,8 +58,10 @@ class Chat:
             payload = self._call("getUpdates", {
                 "offset": offset, "timeout": self.timeout,
                 "allowed_updates": json.dumps(["message"])})
-        except Exception:  # noqa: BLE001 - a dropped poll is retried next tick
+        except Exception as exc:  # noqa: BLE001 - retried next tick, but counted
+            self._failed(exc)
             return [], offset
+        self._worked()
         messages = []
         next_offset = offset
         for update in payload.get("result") or []:
@@ -53,16 +80,25 @@ class Chat:
     def send(self, chat_id, text):
         try:
             self._call("sendMessage", {"chat_id": chat_id, "text": text})
-            return True
-        except Exception:  # noqa: BLE001 - notification loss must not stop work
+        except Exception as exc:  # noqa: BLE001 - notification loss must not stop work
+            self._failed(exc)
             return False
+        self._worked()
+        return True
 
 
 class NullChat:
-    """Stand-in when no token is configured. Records instead of sending."""
+    """Stand-in when no token is configured. Records instead of sending.
 
-    def __init__(self):
+    ``reason`` is why there is no real transport. It is a standing condition
+    rather than a failure count: nothing the daemon does will fix it, so it is
+    reported once and does not tick upwards.
+    """
+
+    def __init__(self, reason=None):
         self.sent = []
+        self.last_error = reason
+        self.failures = 0
 
     def allowed(self, chat_id):
         return True

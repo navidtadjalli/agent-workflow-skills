@@ -46,7 +46,14 @@ family under `dispatch/backends/`, each exposing the same three functions:
 build_command(task, prompt_path, cwd) -> argv
 parse_result(stdout, task_dir)        -> {status, summary, next, session_id}
 resume_args(session_id)               -> [str]
+reset(task_dir)                       -> None
 ```
+
+`reset` is called immediately before each step launches and clears whatever the
+backend reads its status from on disk. Codex reports through a file written by
+`-o`, which it does not touch when it dies; without the clear, a step killed at
+`step_timeout` reads the previous step's block and settles as that step's
+success. Claude reports in its own stdout, so its `reset` does nothing.
 
 The prompt is written once at enqueue to `tasks/<id>/prompt.txt` and fed on
 stdin. Three reasons, in order of how likely each is to bite: shell quoting of
@@ -141,6 +148,30 @@ Admission moves from global to per-lane. A task is admitted when:
 The repo lock stays global across lanes. That is the only coupling between them,
 and it is deliberate: a codex worker and a claude worker editing one checkout at
 once would interleave commits on the same branch.
+
+**Correction to the 2026-08-18 design on `est_cost_pct`.** That document says it
+is "learned per repo from observed step costs, seeded conservatively". Only the
+seed is real. `governor.est_cost_pct` reads `state.json`'s `repo_cost_pct` and
+falls back to `default_est_cost_pct` (6.0); `governor.learn_cost` exists and is
+tested, but nothing in the daemon calls it, so `repo_cost_pct` is never written
+and the value used by rule 6 is always the 6% default. Read the rule as "a flat
+6% headroom check", not as an adaptive one.
+
+*Known gap, deliberately left open here:* wiring the learning needs a per-step
+cost actually observed somewhere in the settle path -- the session percentage
+before the step against the one after it -- and the Claude governor only has a
+real number at a poll, which is paced behind a floor and is not aligned with
+step boundaries. Estimating the delta from the projection would teach the model
+its own guess. Until there is a measurement worth learning from, the constant is
+the honest implementation.
+
+**Both windows drive wind-down.** Rule 6 is not the only per-lane gate:
+`week_pct >= week_soft` refuses admission too, and the wind-down machine reads
+the same predicate. A lane at or above its weekly soft limit is `frozen` -- not
+`running` -- and its resume is armed for the weekly reset rather than the
+session one. Reporting `running` while admitting nothing would invert the one
+distinction this document asks the user to read: `running` is dispatching,
+`frozen` is deferred.
 
 ```
 claude  session 91%  ->  winding-down, resume ~7:50pm

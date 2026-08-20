@@ -13,6 +13,12 @@ Four modes, and the transitions between them are the whole point:
 
 The hard limit is the exception: at that point a straggler is terminated
 (SIGTERM, grace, then SIGKILL) and whatever it produced is salvage-committed.
+
+Two windows drive the transitions, not one. ``scheduler.admit`` refuses on
+either the session or the weekly soft limit, and this machine has to agree with
+it in both cases: a lane that can admit nothing must not report ``running``,
+because ``running`` is what the user is told to read as "dispatching normally"
+and ``frozen`` as "deferred".
 """
 
 RUNNING = "running"
@@ -23,7 +29,30 @@ PAUSED = "paused"
 RESUME_DELAY = 60  # seconds after the reset before resuming, for clock skew
 
 
-def next_mode(mode, session_pct, running, config, stale=False):
+def week_blocked(week_pct, config):
+    """True when the weekly window alone forbids dispatch.
+
+    The same predicate ``scheduler.admit`` applies. It lives here because the
+    mode machine has to agree with it: a lane that admits nothing must not
+    report ``running``, which the user is told to read as "dispatching
+    normally".
+    """
+    return week_pct is not None and week_pct >= config["week_soft"]
+
+
+def binding_reset(reading, config):
+    """The reset a freeze should wait for, given which window is full.
+
+    A codex lane at 5h 2% and 7d 100% resets its session window in an hour and
+    its weekly one in three days. Arming on the session reset would wake the
+    lane every hour to be refused again by the very same week reading.
+    """
+    if week_blocked(reading.get("week_pct"), config):
+        return reading.get("week_resets_at") or reading.get("resets_at")
+    return reading.get("resets_at")
+
+
+def next_mode(mode, session_pct, running, config, stale=False, week_pct=None):
     """Pure transition function. Returns the mode implied by the situation."""
     if mode == PAUSED:
         # A human outranks a reading. Left to the rules below, a lane paused
@@ -33,14 +62,22 @@ def next_mode(mode, session_pct, running, config, stale=False):
         # leaves this mode.
         return PAUSED
 
+    if mode == FROZEN:
+        # Only a confirmed reset leaves frozen; see can_resume. Checked before
+        # the week window and before the reading guards, all of which would
+        # return FROZEN here anyway.
+        return FROZEN
+
+    if week_blocked(week_pct, config):
+        # A weekly percentage does not depend on the session window and does
+        # not go stale the way a projected one does: it is refused by
+        # `admit` whatever the session reading says, so the mode says so too.
+        return FROZEN if running == 0 else WINDING_DOWN
+
     if session_pct is None or stale:
         # Never escalate on a guess; hold the current mode and let the caller
         # poll. Only an explicit pause or a real reading moves us.
         return mode
-
-    if mode == FROZEN:
-        # Only a confirmed reset leaves frozen; see can_resume.
-        return FROZEN
 
     if session_pct >= config["session_soft"]:
         # Past soft or hard, the destination is the same: drain, then freeze.
@@ -65,12 +102,16 @@ def resume_at(session_reset):
     return None if not session_reset else session_reset + RESUME_DELAY
 
 
-def can_resume(state_doc, session_pct, now, config, stale):
+def can_resume(state_doc, session_pct, now, config, stale, week_pct=None):
     """Whether an armed resume should actually fire.
 
     The timer only wakes us; the reset is confirmed by a fresh reading, because
     a timer that fires early would burn the first request of the new window on
     a task that immediately hits the same wall.
+
+    The week is checked for the same reason ``next_mode`` checks it: resuming a
+    lane that ``admit`` still refuses would re-freeze it on the next tick, and
+    the user would get a freeze notice every tick until the week rolled over.
     """
     if state_doc.get("mode") != FROZEN:
         return False, "not frozen"
@@ -79,6 +120,8 @@ def can_resume(state_doc, session_pct, now, config, stale):
         return False, "resume armed for later"
     if stale or session_pct is None:
         return False, "usage unknown; poll before resuming"
+    if week_blocked(week_pct, config):
+        return False, "weekly usage still %.0f%%" % week_pct
     if session_pct >= config["session_soft"]:
         return False, "usage still %.0f%%" % session_pct
     return True, "reset confirmed"

@@ -72,6 +72,9 @@ def run_step(task, cwd, config, env=None, popen=None, sleeper=None, task_dir=Non
     popen = popen or subprocess.Popen
     task_dir = task_dir or config_mod.task_dir(task["id"])
     prompt_path = write_prompt(task, task_dir)
+    # Before anything is launched: a status file left by the previous step must
+    # not be readable as this one's result if this one dies without writing.
+    backends.get(lanes.of(task)).reset(task_dir)
     argv = build_command(task, prompt_path, cwd, task_dir)
 
     with open(prompt_path) as prompt_handle:

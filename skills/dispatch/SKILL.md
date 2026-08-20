@@ -32,14 +32,17 @@ deferred, and its branch and handoff note are intact.
 ## Queue work
 
 ```bash
-dispatch add <repo-alias> "<task>"
-dispatch add <repo-alias> "<task>" --worktree      # isolate; do not serialize on the repo
-dispatch add <repo-alias> "<task>" --dep t-0007    # wait for another task
+dispatch add <repo> "<task>"
+dispatch add <repo> "<task>" --agent codex         # the codex lane; default is claude
+dispatch add <repo> "<task>" --worktree            # isolate; do not serialize on the repo
+dispatch add <repo> "<task>" --dep t-0007          # wait for another task
 ```
 
-Only configured aliases are dispatchable, and workers run without permission
-prompts. Treat the alias list as the trust boundary: if a repo is not aliased,
-say so rather than adding it.
+`<repo>` is a folder under the projects root, discovered each time -- there is
+no hand-maintained alias list any more. A folder without a `.git` is listed but
+refused, because a worker there would have nowhere to checkpoint. Workers run
+without permission prompts, so "every git repo under the projects root" is the
+trust boundary; if a name is refused, say so rather than widening it.
 
 ## Phrase tasks so they survive a wind-down
 

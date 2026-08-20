@@ -46,6 +46,10 @@ argv = sys.argv[1:]
 prompt = sys.stdin.read()
 out = argv[argv.index("-o") + 1]
 mode = os.environ.get("STUB_MODE", "complete")
+if mode == "die":
+    # Killed at the step timeout, or crashed: no status file is written.
+    sys.stderr.write("codex stub died\\n")
+    sys.exit(3)
 open(os.path.join(os.environ["STUB_REPO"], "worked.txt"), "a").write("codex\\n")
 with open(out, "w") as fh:
     json.dump({"status": mode, "summary": "codex stub", "next": ""}, fh)
@@ -94,6 +98,14 @@ class DispatchIntegration(unittest.TestCase):
             "DISPATCH_TRANSCRIPTS": os.path.join(root, "transcripts"),
             "DISPATCH_CODEX_SESSIONS": os.path.join(root, "codex-sessions"),
         })
+
+        # On disk as well as injected: a CLI subprocess gets no in-memory
+        # config, and without this `dispatch add` would discover the
+        # developer's real ~/Projects.
+        state.write(config_mod.config_path(), {
+            "projects_root": os.path.join(root, "empty-root"),
+            "repos": {"demo": self.repo, "other": self.repo2},
+            "chat_allowlist": []})
 
         for repo in (self.repo, self.repo2):
             self._git("init", "-q", cwd=repo)
@@ -353,6 +365,64 @@ class DispatchIntegration(unittest.TestCase):
             "stale": False, "resets_at": None})
         daemon.tick()
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"], "done")
+
+    def test_a_dead_codex_step_does_not_settle_as_the_previous_one(self):
+        """`-o` writes the status file only when codex finishes. Nothing
+        cleared it between steps, so a step that died read the previous step's
+        block and settled as its success -- another `steps_done`, another
+        checkpoint commit, and a summary describing work it never did."""
+        os.environ["STUB_MODE"] = "continue"
+        task = self._enqueue("codex work", agent="codex")
+        daemon = self._daemon()
+        daemon.tick()
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"],
+                         "queued")
+
+        os.environ["STUB_MODE"] = "die"
+        self.now += 120
+        daemon.tick()
+        settled = state.find(state.read_queue(), task["id"])
+        self.assertEqual(settled["state"], "failed")
+        self.assertEqual(settled["last_error"], "no status block from worker")
+        self.assertFalse(os.path.exists(
+            os.path.join(config_mod.task_dir(task["id"]), "last.json")))
+
+    def test_a_checkpoint_that_cannot_run_fails_the_task(self):
+        """A `tg` branch blocks `tg/<id>`, so `checkout -B` really fails.
+
+        The work is uncommitted; reporting `done` would point chat and
+        `handoff.md` at a branch with nothing on it."""
+        self._git("branch", "tg", cwd=self.repo2)
+        task = self._enqueue("work", repo="other")
+        daemon = self._daemon()
+        daemon.tick()
+
+        settled = state.find(state.read_queue(), task["id"])
+        self.assertEqual(settled["state"], "failed")
+        self.assertIn("checkpoint failed", settled["last_error"])
+        self.assertTrue(any("not committed" in notice for notice in daemon.notices),
+                        daemon.notices)
+        directory = config_mod.task_dir(task["id"])
+        with open(os.path.join(directory, "steps.jsonl")) as fh:
+            step = json.loads(fh.read().strip())
+        self.assertTrue(step["checkpoint_error"])
+        self.assertTrue(os.path.exists(os.path.join(directory, "handoff.md")))
+
+    def test_the_cli_queues_against_the_same_repos_the_daemon_accepts(self):
+        """`dispatch add` is the whole fallback when Telegram is down."""
+        out = subprocess.run([sys.executable, CLI, "add", "demo", "do the thing",
+                              "--agent", "codex"],
+                             capture_output=True, text=True, env=os.environ)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        task = state.read_queue()["tasks"][0]
+        self.assertEqual((task["repo"], task["agent"]), ("demo", lanes.CODEX))
+        self.assertIn(task["id"], out.stdout)
+
+        refused = subprocess.run([sys.executable, CLI, "add", "nowhere", "x"],
+                                 capture_output=True, text=True, env=os.environ)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("unknown repo", refused.stderr)
+        self.assertIn("demo", refused.stderr)
 
     def test_cli_status_and_queue_run_against_the_same_state(self):
         self._enqueue()
