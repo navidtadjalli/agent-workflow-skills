@@ -37,10 +37,14 @@ state.json    governor snapshot · chat offset · per-lane mode and armed resume
               · repo_cost_pct (reserved; nothing writes it yet)
 daemon.log    tracebacks the tmux pane cannot keep, plus startup failures;
 daemon.log.1  rolls over once at 1MB
-locks/        flock files, one per repo or isolated worktree
+locks/        flock files: `repo-<name>` per repo, `worktree-<id>` per
+              isolated task, `worktree-add-<repo>` around the git metadata
+              mutation that creates or removes one
 tasks/<id>/   prompt.txt · steps.jsonl · worker.log · handoff.md
               · last.json (codex only; cleared before every step, so a
                 step that dies cannot be read as the previous one)
+worktrees/    one linked git worktree per live `isolation=worktree` task,
+<id>/         named for the task; see "Isolated worktrees" below
 ```
 
 `daemon.log` is the one that matters after a crash: the tmux session dies with
@@ -67,7 +71,61 @@ chat_allowlist   chat ids allowed to drive the daemon. Empty means nobody.
 projects_root    where repos are discovered (default ~/Projects)
 repos            alias -> path, for repos outside that root
 codex_sandbox    how codex workers are confined (default approve-for-me)
+worktree_root    where isolated tasks get their checkout
+                 (default <DISPATCH_HOME>/worktrees)
 ```
+
+## Isolated worktrees
+
+`codex bump deps on qpay in a worktree` in chat, or `dispatch add qpay "..."
+--worktree`, marks a task `isolation=worktree`. That is a claim about
+contention: the scheduler gives such a task a `worktree-<id>` lock instead of
+the shared `repo-<name>` one, so two of them on the same repository are both
+admitted at once. The daemon therefore has to give each one a checkout of its
+own, and it does -- a real `git worktree`, created just before the first step
+and reused by every later step of that task.
+
+**It never falls back to the parent checkout.** If the worktree cannot be
+created the task is `blocked` with the git error attached, and chat is told.
+Running it in the shared tree instead would be two unattended agents doing
+`git checkout -B` and `git add -A && git commit` in one working directory,
+which is the failure the lock name already claimed was impossible.
+
+```
+~/.claude/dispatch/worktrees/t-0042      the task's checkout, on branch tg/t-0042
+~/Projects/qpay                          untouched: its HEAD never moves
+```
+
+The location is outside `projects_root` on purpose. A linked worktree's `.git`
+is a *file*, and repo discovery treats a `.git` file as a dispatchable
+repository, so a worktree parked among the checkouts would be listed by `repos`
+and reachable from chat under its own name -- another lane pointed straight
+into an isolated task's private tree, under a different lock.
+
+Commits go where they always went: `tg/<id>` in the parent repository. The
+worktree holds nothing the branch does not, which is what makes it disposable.
+
+| Task ends | Worktree |
+|---|---|
+| `done`, `cancelled`, or gone from the queue | removed, with its registration pruned. The branch stays |
+| `paused` | **kept** -- the next step after the reset resumes into it |
+| `blocked`, `failed` | kept -- `handoff.md` names the directory, and whatever the last step left uncommitted lives nowhere else |
+
+Kept trees are released by `dispatch cancel <id>`; the sweep runs off the queue
+once a tick, so it also collects a task cancelled while it was parked and one
+left behind by a daemon that died mid-step. Nothing collects the tree of a task
+you leave `blocked` forever -- that is deliberate, and it is a disk cost.
+
+**One thing to know if you run codex in worktrees.** `codex exec resume` takes
+no sandbox flag, so from step two onward a codex worker is confined by the trust
+levels in `~/.codex/config.toml`, which are keyed on the path. On this machine
+`~/Projects` is `trust_level = "trusted"` and everything else is not, so a
+multi-step codex task in a worktree under `~/.claude/dispatch/` runs read-only
+after its first step. Three ways out, in order of preference: mark the worktree
+root trusted in `~/.codex/config.toml`; set `worktree_root` to a directory
+inside `~/Projects` that is not a direct child of it (a direct child would be
+discovered as a repo); or use the claude lane for isolated work. Claude workers
+are unaffected -- their confinement is the directory they are pointed at.
 
 ## What the governor actually knows
 
@@ -118,6 +176,10 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | The bot answers nobody, and `status` says the allowlist is empty | `config.json` is missing, did not parse, or holds something that is not a list of ids | `dispatch setup --chat <chat-id>`, then **`dispatch down && dispatch up`** -- the transport is built once at startup and is never rebuilt, so a config edit does not revive a running daemon. Check stderr for a `config.json.corrupt` line first |
 | Session gone, no explanation in the pane | The daemon died with it | `dispatch logs --daemon` falls back to `daemon.log`, which outlives the session |
 | Task `failed` with `checkpoint failed: ...` | The step's work could not be committed | Fix the repo (a stale lock, a conflicting ref), then re-add; the tree still holds the work |
+| Task `blocked` with `no worktree: fatal: invalid reference: HEAD` | `isolation=worktree` against a repository with no commits | Make one commit in the repo, then `dispatch retry <id>` |
+| Task `blocked` with `no worktree: fatal: 'tg/<id>' is already used by worktree at ...` | The task branch is checked out somewhere else | Move that checkout off the branch, or remove the stale worktree with `git worktree remove`, then `dispatch retry <id>` |
+| Task `blocked` with `no worktree: ... is not a git worktree` | Something else is sitting at the task's worktree path | Look at it, move it out of the way yourself -- the daemon will not delete a directory it did not create -- then `dispatch retry <id>` |
+| A codex worktree task does nothing after its first step | `codex exec resume` carries no sandbox flag and the worktree is outside a trusted path | See "Isolated worktrees" |
 
 ## Safety
 

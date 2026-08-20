@@ -229,7 +229,7 @@ repository" is a safety question, and guessing is the wrong answer.
 claude <prompt> on <repo>          queue, agent=claude
 codex  <prompt> on <repo>          queue, agent=codex
 claude <repo>: <prompt>            colon form, same thing
-… on <repo> in a worktree          isolation=worktree, as before
+… on <repo> in a worktree          isolation=worktree; see below
 
 run <task> on <repo>               unchanged; agent=claude
 status · queue · usage · usage poll · sessions · repos
@@ -238,6 +238,50 @@ logs <id> · cancel <id> · retry <id> · pause · resume · help
 
 `queue` gains a lane column. `status` reports both governors and both modes.
 `pause` and `resume` take an optional lane (`pause codex`), defaulting to both.
+
+### Isolation
+
+`isolation=worktree` was a scheduling claim with no execution behind it: the
+task took a `worktree-<id>` lock instead of `repo-<name>`, and then ran in the
+parent checkout anyway. Two such tasks on one repository both passed admission
+and both ran in the same working tree -- interleaved `git checkout -B` and
+`git add -A && git commit` from two unattended agents. Unused the feature was
+harmless; used, it removed the only guard there was.
+
+The lock name is right; the execution now matches it. An isolated task gets a
+real `git worktree` at `<worktree_root>/<task-id>`, created before its first
+step and reused by every later one, on branch `tg/<id>`. The parent checkout is
+never touched -- in particular its HEAD stays where it was, which the shared
+path did not manage.
+
+- **Placement.** `<DISPATCH_HOME>/worktrees/<id>` by default, outside
+  `projects_root`. A linked worktree's `.git` is a *file*, and `repos.discover`
+  accepts a `.git` file as a dispatchable repository, so a worktree among the
+  checkouts would be dispatchable in its own right -- reachable from chat, under
+  a `repo-<name>` lock, inside another task's private tree. `worktree_root`
+  overrides it for the codex trust-level case in `docs/operations.md`.
+- **Lifecycle.** Removed at `done`, `cancelled`, or disappearance from the
+  queue; kept at `paused`, which resumes into it, and kept at `blocked` and
+  `failed`, where `handoff.md` names it and the uncommitted remains of the last
+  step exist nowhere else. Collected by a queue-driven sweep once a tick, so a
+  task cancelled while parked and a daemon that died mid-step are both covered.
+  `git worktree prune` runs before every creation and after every removal.
+- **Creation is a repo mutation.** `git worktree add` writes the parent's
+  `.git/worktrees/` and creates a ref, so it is serialized on a dedicated
+  `worktree-add-<repo>` lock, taken non-blocking and held only across the git
+  call. Not the `repo-<name>` lock: a repo-lane worker holds that for a whole
+  step, so waiting on it would queue isolated tasks behind exactly the work they
+  were declared isolated from, and it would be a second lock taken inside
+  `worktree-<id>` on a path that also runs a subprocess. No queue or state
+  document is open across any of it.
+- **Failure.** No commits, a `tg/<id>` already checked out elsewhere, a full
+  disk, anything: the task lands `blocked` with the git error in `last_error`
+  and a chat notice. **It never runs in the parent checkout instead** -- that is
+  the bug, not a fallback.
+- **Checkpointing.** `worker.checkpoint` runs `git checkout -B <branch>` only
+  when HEAD is not already the branch. A worktree is created *on* `tg/<id>`, so
+  the checkout is skipped -- which is necessary as well as tidy: git refuses to
+  check out a branch that is live in another worktree.
 
 Everything above parses with zero model calls, which is the property that lets
 the daemon keep answering while a window is exhausted. Free-form text still
@@ -440,6 +484,13 @@ Pure-function coverage in `tests/dispatch_test.py`:
 Integration coverage in `tests/dispatch_integration.py`:
 
 - a codex task and a claude task contending for one repo lock
+- two `isolation=worktree` tasks on one repository, asserted on the working
+  directories the steps are actually launched in
+- an isolated task running beside repo-lane work in the same repository
+- the parent checkout after an isolated step: HEAD unmoved, tree clean
+- worktree kept at `paused` and `blocked`, released at `done` and `cancelled`
+- creation failures -- no commits, branch already checked out, a foreign
+  directory in the way -- blocking the task rather than running in the parent
 - one lane freezing while the other keeps dispatching
 - a codex task admitted from a stale-but-unexpired reading
 - prompt-file round trip: enqueue writes it, the stub agent reads it on stdin
