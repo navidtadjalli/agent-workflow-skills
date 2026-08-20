@@ -840,6 +840,17 @@ class TestRepoDiscovery(unittest.TestCase):
         self.assertEqual(repos.resolve("poook", root=self.root),
                          os.path.join(self.root, "poook"))
 
+    def test_linked_worktree_is_dispatchable(self):
+        """A linked worktree's .git is a file holding a gitdir: pointer."""
+        worktree = os.path.join(self.root, "linked")
+        os.makedirs(worktree)
+        with open(os.path.join(worktree, ".git"), "w") as fh:
+            fh.write("gitdir: /somewhere/.git/worktrees/linked\n")
+        found = repos.discover(root=self.root)
+        self.assertTrue(found["linked"]["git"])
+        self.assertIn("linked", repos.dispatchable(found))
+        self.assertEqual(repos.resolve("linked", root=self.root), worktree)
+
     def test_hidden_folders_are_ignored(self):
         os.makedirs(os.path.join(self.root, ".cache"))
         self.assertNotIn(".cache", repos.discover(root=self.root))

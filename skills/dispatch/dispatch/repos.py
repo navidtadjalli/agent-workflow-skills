@@ -21,7 +21,10 @@ def root_path(config=None):
 
 
 def _entry(path):
-    return {"path": path, "git": os.path.isdir(os.path.join(path, ".git"))}
+    # `.git` is a directory in a normal clone and a file holding a `gitdir:`
+    # pointer in a linked worktree. Both can checkpoint to tg/<id>, so both
+    # count as dispatchable.
+    return {"path": path, "git": os.path.exists(os.path.join(path, ".git"))}
 
 
 def discover(root=None, overrides=None):
