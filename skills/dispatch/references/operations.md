@@ -158,20 +158,16 @@ dispatch down && dispatch up
 One asymmetry: `codex exec resume` parses a narrower set of options than `codex
 exec` and accepts neither `-s` nor `--approve-for-me` (measured on codex-cli
 0.148.0). A continuation step therefore carries no sandbox flag at all unless
-`codex_sandbox` is `bypass`, and runs under codex's own default policy.
+`codex_sandbox` is `bypass`, and runs under codex's own default policy. It is
+also not passed `-C`, which that parser rejects outright; the worker launches
+the process in the repository either way.
 
 Claude has no equivalent flag: `--dangerously-skip-permissions` is how a
 headless Claude worker runs unattended, and the confinement there is the repo it
 is pointed at.
 
-## Known issue: resumed codex steps
-
-`codex exec resume` also rejects the `-C <cwd>` that every step passes, with
-`error: unexpected argument '-C' found` and exit status 2 -- so a codex task
-that reports `continue` fails on its next step, before doing any work, with no
-status file to read. This predates the sandbox change and is not fixed here: the
-fix is to drop `-C` from the resume form (the worker already launches the
-process with its cwd set), and it needs one live codex step to confirm. Until
-then, codex tasks that need more than one step will land in `failed`; `dispatch
-logs <id>` shows the parse error. The claude lane is unaffected.
+If a codex step ever fails with `error: unexpected argument` and exit status 2,
+that is this class of bug and not the agent: the flag was rejected by the parser
+before any work happened, so there is no status file and the task settles as
+`failed`. `dispatch logs <id>` shows the parse error verbatim.
 

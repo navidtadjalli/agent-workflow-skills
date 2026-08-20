@@ -944,6 +944,52 @@ class TestBackends(unittest.TestCase):
             self.assertNotIn("--approve-for-me", argv, mode)
             self.assertNotIn("-s", argv, mode)
 
+    # Every option `codex exec resume` accepts, read from its own --help on
+    # codex-cli 0.148.0. `codex exec` takes a wider set -- `-C`, `-s`,
+    # `--approve-for-me`, `--add-dir`, `-p` -- and the resume subcommand
+    # rejects each of them with `error: unexpected argument`, exit 2, before
+    # doing any work. Two flag-shape bugs have now come out of this argv, so
+    # the whole shape is asserted rather than one flag at a time.
+    RESUME_ACCEPTS = {
+        "-c", "--config", "--last", "--all", "--enable", "--disable",
+        "-i", "--image", "--strict-config", "-m", "--model",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust", "--skip-git-repo-check",
+        "--ephemeral", "--ignore-user-config", "--ignore-rules",
+        "--output-schema", "--json", "-o", "--output-last-message",
+    }
+
+    def test_a_resumed_step_does_not_pass_a_working_directory(self):
+        """`-C` is rejected by the resume parser, and unnecessary anywhere:
+        `run_step` launches the process with `cwd=cwd` regardless."""
+        first = backends.codex.build_command(
+            dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+            self.tmp.name)
+        self.assertEqual(first[first.index("-C") + 1], "/repo")
+
+        resumed = backends.codex.build_command(
+            dict(self.task, agent="codex", session_id="abc"), "/p/prompt.txt",
+            "/repo", self.tmp.name)
+        self.assertNotIn("-C", resumed)
+        self.assertNotIn("/repo", resumed)
+
+    def test_a_resumed_argv_carries_only_options_the_resume_parser_accepts(self):
+        for mode in ("approve-for-me", "read-only", "workspace-write",
+                     "danger-full-access", "bypass", None):
+            argv = backends.codex.build_command(
+                dict(self.task, agent="codex", session_id="abc"),
+                "/p/prompt.txt", "/repo", self.tmp.name,
+                config={"codex_sandbox": mode} if mode else None)
+            self.assertEqual(argv[:4], ["codex", "exec", "resume", "abc"], mode)
+            # The bare `-` is the PROMPT positional, not an option: `codex exec
+            # resume [SESSION_ID] [PROMPT]`, and "if `-` is used, read from
+            # stdin" -- which is how the prompt file is fed.
+            self.assertEqual(argv[4], "-", mode)
+            offenders = [a for a in argv[5:]
+                         if a.startswith("-") and a != "-"
+                         and a not in self.RESUME_ACCEPTS]
+            self.assertEqual(offenders, [], "%s: %s" % (mode, argv))
+
     def test_an_explicit_bypass_is_the_one_mode_a_resume_still_takes(self):
         argv = backends.codex.build_command(
             dict(self.task, agent="codex", session_id="abc"), "/p/prompt.txt",

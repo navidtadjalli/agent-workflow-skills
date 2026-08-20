@@ -319,6 +319,29 @@ class DispatchIntegration(unittest.TestCase):
         self.assertEqual(settled["session_id"], "codex-stub")
         self.assertIn("tg/t-0001", self._git("branch", "--list", "tg/t-0001").stdout)
 
+    def test_a_second_codex_step_resumes_without_the_flag_that_kills_it(self):
+        """The path that was broken: `codex exec resume` rejects `-C` with exit
+        2, so a codex task that reported `continue` died on its next step
+        before doing any work -- and settled as a failure that reads like the
+        agent misbehaving. Driven through the real worker, argv recorded by the
+        stub; a live codex is never invoked."""
+        os.environ["STUB_MODE"] = "continue"
+        task = self._enqueue("codex work", agent="codex")
+        self._daemon().tick()
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"],
+                         "queued")
+
+        os.environ["STUB_MODE"] = "complete"
+        self._daemon().tick()
+        # Recorded by the stub as `sys.argv[1:]`, so "codex" itself is not here.
+        first, second = self._codex_argv()[:2]
+        self.assertEqual(first[:2], ["exec", "-"])
+        self.assertEqual(second[:3], ["exec", "resume", "codex-stub"])
+        self.assertNotIn("-C", second)
+        self.assertIn("-C", first)
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"],
+                         "done")
+
     def test_codex_lane_runs_while_the_claude_lane_is_frozen(self):
         self._enqueue("claude work", agent="claude")
         self._enqueue("codex work", agent="codex")

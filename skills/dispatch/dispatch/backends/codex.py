@@ -19,12 +19,14 @@ window was full -- and a mode that stalls on approvals must be recoverable by
 editing one value, not by editing this file and redeploying.
 
 That applies to a first step. ``codex exec resume`` parses a narrower set of
-options than ``codex exec`` and takes neither ``-s`` nor ``--approve-for-me``,
-so a continuation runs under codex's own default policy unless the bypass was
-asked for explicitly. Related, and *not* fixed here: the same narrower parser
-also rejects the ``-C`` this function passes on every step, so a resumed codex
-step exits 2 before it starts. That predates this change and needs a live codex
-to verify a fix against; see the hardening report.
+options than ``codex exec``: measured on codex-cli 0.148.0 it takes neither
+``-s`` nor ``--approve-for-me`` nor ``-C``, and rejects each with ``error:
+unexpected argument`` and exit 2 -- before doing any work, so the step dies with
+no status file and settles as a failure that reads like the agent misbehaving.
+Two things follow. A continuation runs under codex's own default policy unless
+the bypass was asked for explicitly, and it is not told a working directory:
+``worker.run_step`` launches the process with ``cwd=cwd`` regardless, so ``-C``
+was belt-and-braces on a first step and illegal on a resume.
 
 Known gap: the session id is recovered by looking for ``thread_id`` /
 ``session_id`` / ``conversation_id`` anywhere in the ``--json`` event stream. If
@@ -127,10 +129,17 @@ def build_command(task, prompt_path, cwd, task_dir, unsafe=True, config=None):
     resuming = bool(task.get("session_id"))
     argv = ["codex", "exec"]
     argv.extend(resume_args(task.get("session_id")))
+    # `-` is the PROMPT positional -- `codex exec [resume <sid>] [PROMPT]` --
+    # and codex reads stdin for it, which is where the prompt file is fed from.
+    argv.append("-")
+    argv.append("--json")
+    if not resuming:
+        # Only `codex exec` takes `-C`; the resume parser rejects it outright.
+        # Nothing is lost: `worker.run_step` launches the process with
+        # ``cwd=cwd`` either way, so the working directory is the repo whether
+        # or not codex is told about it.
+        argv.extend(["-C", cwd])
     argv.extend([
-        "-",                       # prompt on stdin
-        "--json",
-        "-C", cwd,
         "--skip-git-repo-check",
         "--output-schema", SCHEMA_PATH,
         "-o", os.path.join(task_dir, STATUS_FILE),
