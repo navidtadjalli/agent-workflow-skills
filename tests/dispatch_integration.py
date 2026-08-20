@@ -48,6 +48,9 @@ print(json.dumps({"session_id": "sess-stub", "result": body}))
 CODEX_STUB = """#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
+# What the daemon really launched, for the tests that assert on confinement.
+# There is no other way to see it: the flags are chosen deep inside run_step.
+open(os.environ["STUB_ARGV"], "a").write(json.dumps(argv) + "\\n")
 prompt = sys.stdin.read()
 out = argv[argv.index("-o") + 1]
 mode = os.environ.get("STUB_MODE", "complete")
@@ -85,12 +88,14 @@ class DispatchIntegration(unittest.TestCase):
                 fh.write(body)
             os.chmod(stub_path, 0o755)
 
+        self.codex_argv = os.path.join(root, "codex-argv.jsonl")
         self._env = dict(os.environ)
         os.environ.update({
             "DISPATCH_HOME": self.home,
             "PATH": bin_dir + os.pathsep + os.environ["PATH"],
             "STUB_REPO": self.repo,
             "STUB_MODE": "complete",
+            "STUB_ARGV": self.codex_argv,
             "GIT_AUTHOR_NAME": "dispatch test",
             "GIT_AUTHOR_EMAIL": "test@example.invalid",
             "GIT_COMMITTER_NAME": "dispatch test",
@@ -140,11 +145,13 @@ class DispatchIntegration(unittest.TestCase):
         codex_reading = {"session_pct": codex_pct, "week_pct": 0.0,
                          "source": "codex-logs", "stale": False, "resets_at": None}
         codex_reading.update(over.pop("codex_reading", {}))
+        # An empty projects root, so discovery never sees the real ~/Projects.
+        config = {"projects_root": os.path.join(self.tmp.name, "empty-root"),
+                  "repos": {"demo": self.repo, "other": self.repo2},
+                  "chat_allowlist": [CHAT_ID]}
+        config.update(over.pop("config_extra", {}))
         return daemon_mod.Daemon(
-            # An empty projects root, so discovery never sees the real ~/Projects.
-            config={"projects_root": os.path.join(self.tmp.name, "empty-root"),
-                    "repos": {"demo": self.repo, "other": self.repo2},
-                    "chat_allowlist": [CHAT_ID]},
+            config=config,
             clock=lambda: self.now,
             poll_usage=lambda: reading,
             count_tokens=lambda: 0,
@@ -415,6 +422,31 @@ class DispatchIntegration(unittest.TestCase):
             step = json.loads(fh.read().strip())
         self.assertTrue(step["checkpoint_error"])
         self.assertTrue(os.path.exists(os.path.join(directory, "handoff.md")))
+
+    def _codex_argv(self):
+        with open(self.codex_argv) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_a_codex_step_is_launched_inside_the_sandbox(self):
+        """Asserted on the real launch: the flag is chosen inside `run_step`,
+        so a unit test of `build_command` alone would not prove it arrives.
+
+        Against the stub, never a real codex -- the weekly window is full, and
+        this mode is unverified against the live tool for that reason."""
+        self._enqueue(agent="codex")
+        self._daemon().tick()
+        argv = self._codex_argv()[0]
+        self.assertIn("--approve-for-me", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_the_bypass_is_one_config_value_away(self):
+        """If the reviewed mode stalls on approvals in real use, this is the
+        recovery: an edit to config.json and a restart, not a code change."""
+        self._enqueue(agent="codex")
+        self._daemon(config_extra={"codex_sandbox": "bypass"}).tick()
+        argv = self._codex_argv()[0]
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--approve-for-me", argv)
 
     def test_the_cli_queues_against_the_same_repos_the_daemon_accepts(self):
         """`dispatch add` is the whole fallback when Telegram is down."""

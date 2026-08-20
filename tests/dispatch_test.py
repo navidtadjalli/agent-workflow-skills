@@ -537,6 +537,39 @@ class TestWorkerContract(unittest.TestCase):
         self.assertIn("tg/t-0042", rules)
         self.assertIn("Never push", rules)
 
+    def test_the_configured_sandbox_reaches_the_argv_through_the_worker(self):
+        task = {"prompt": "do", "branch": "tg/t-1", "agent": "codex",
+                "session_id": None}
+        self.assertIn("--approve-for-me", worker.build_command(
+            task, "/p/prompt.txt", "/repo", "/unused"))
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox",
+                      worker.build_command(task, "/p/prompt.txt", "/repo",
+                                           "/unused",
+                                           config={"codex_sandbox": "bypass"}))
+
+    def test_run_step_hands_the_backend_the_config_it_was_given(self):
+        """`run_step` is the only caller of `build_command` that holds the
+        config, so a mode that never reaches it is a mode nobody can select."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        task = {"id": "t-0001", "repo": "qpay", "prompt": "do", "agent": "codex",
+                "branch": "tg/t-1", "session_id": None}
+        seen = []
+
+        class _Process:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", None
+
+        def popen(argv, **kwargs):
+            seen.append(argv)
+            return _Process()
+
+        config = dict(CONFIG, codex_sandbox="workspace-write")
+        worker.run_step(task, tmp.name, config, popen=popen, task_dir=tmp.name)
+        self.assertEqual(seen[0][-2:], ["-s", "workspace-write"])
+
     def test_resume_flag_only_with_a_session(self):
         task = {"prompt": "do", "branch": "tg/t-1", "session_id": None}
         self.assertNotIn("--resume", worker.build_command(
@@ -844,11 +877,97 @@ class TestBackends(unittest.TestCase):
         self.assertEqual(argv[:3], ["codex", "exec", "-"])
         self.assertIn("--json", argv)
         self.assertEqual(argv[argv.index("-C") + 1], "/repo")
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertTrue(argv[argv.index("--output-schema") + 1].endswith(
             "status.schema.json"))
         self.assertEqual(argv[argv.index("-o") + 1],
                          os.path.join(self.tmp.name, "last.json"))
+
+    def test_codex_runs_in_its_sandbox_by_default(self):
+        """`--approve-for-me` is unattended *and* confined: approvals are
+        routed through codex's automatic review, and the workspace is the repo
+        the task named. The bypass flag is neither."""
+        argv = backends.codex.build_command(
+            dict(self.task, agent="codex"), "/p/prompt.txt", "/repo", self.tmp.name)
+        self.assertIn("--approve-for-me", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_the_configured_sandbox_selects_the_flags(self):
+        """One config value, because the reviewed mode is unverified against a
+        live codex: if it stalls, the user flips this rather than waiting for a
+        code change."""
+        cases = {"approve-for-me": ["--approve-for-me"],
+                 "read-only": ["-s", "read-only"],
+                 "workspace-write": ["-s", "workspace-write"],
+                 "danger-full-access": ["-s", "danger-full-access"],
+                 "bypass": ["--dangerously-bypass-approvals-and-sandbox"]}
+        for mode, expected in cases.items():
+            argv = backends.codex.build_command(
+                dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+                self.tmp.name, config={"codex_sandbox": mode})
+            self.assertEqual(argv[-len(expected):], expected, mode)
+            self.assertEqual(argv[:3], ["codex", "exec", "-"], mode)
+
+    def test_the_default_config_selects_the_sandboxed_mode(self):
+        self.assertEqual(config_mod.DEFAULTS["codex_sandbox"], "approve-for-me")
+        argv = backends.codex.build_command(
+            dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+            self.tmp.name, config=config_mod.DEFAULTS)
+        self.assertIn("--approve-for-me", argv)
+
+    def test_an_unknown_sandbox_falls_back_to_the_confined_one_and_says_so(self):
+        """A typo in a security-relevant key must not be read as the most
+        permissive thing on the list."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            argv = backends.codex.build_command(
+                dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+                self.tmp.name, config={"codex_sandbox": "yolo"})
+        self.assertIn("--approve-for-me", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("yolo", err.getvalue())
+
+    def test_a_resumed_step_carries_no_flag_the_resume_parser_rejects(self):
+        """`codex exec resume` is a different parser from `codex exec`.
+
+        Measured against codex-cli 0.148.0: `codex exec resume -s ... --help`
+        and `... --approve-for-me --help` both exit 2 with `unexpected
+        argument`. A rejected flag is not a weaker sandbox, it is a step that
+        never starts -- so a continuation carries neither, and runs under
+        codex's own default policy instead.
+        """
+        task = dict(self.task, agent="codex", session_id="abc")
+        for mode in ("approve-for-me", "read-only", "workspace-write",
+                     "danger-full-access", None):
+            argv = backends.codex.build_command(
+                task, "/p/prompt.txt", "/repo", self.tmp.name,
+                config={"codex_sandbox": mode} if mode else None)
+            self.assertEqual(argv[:3], ["codex", "exec", "resume"], mode)
+            self.assertNotIn("--approve-for-me", argv, mode)
+            self.assertNotIn("-s", argv, mode)
+
+    def test_an_explicit_bypass_is_the_one_mode_a_resume_still_takes(self):
+        argv = backends.codex.build_command(
+            dict(self.task, agent="codex", session_id="abc"), "/p/prompt.txt",
+            "/repo", self.tmp.name, config={"codex_sandbox": "bypass"})
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_a_safe_build_asks_for_no_sandbox_flag_at_all(self):
+        """`unsafe=False` is unchanged: it emits nothing and lets codex decide,
+        whatever the configured mode says."""
+        argv = backends.codex.build_command(
+            dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+            self.tmp.name, unsafe=False, config={"codex_sandbox": "bypass"})
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--approve-for-me", argv)
+        self.assertNotIn("-s", argv)
+
+    def test_claude_has_no_sandbox_option_and_ignores_the_key(self):
+        """codex-only, deliberately: `claude` has no equivalent flag."""
+        argv = backends.claude.build_command(
+            self.task, "/p/prompt.txt", "/repo", self.tmp.name,
+            config={"codex_sandbox": "read-only"})
+        self.assertNotIn("-s", argv)
+        self.assertNotIn("--approve-for-me", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
 
     def test_codex_schema_file_is_valid_json_and_requires_status(self):
         with open(backends.codex.SCHEMA_PATH) as fh:

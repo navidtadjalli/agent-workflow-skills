@@ -18,6 +18,13 @@ DEFAULTS = {
     # Worker supervision.
     "step_timeout": 3600,
     "term_grace": 20,
+    # How codex workers are confined. `approve-for-me` is unattended and keeps
+    # codex's sandbox: approvals go through its automatic review and the
+    # workspace is the repo the task named. `read-only`, `workspace-write` and
+    # `danger-full-access` select `-s` directly; `bypass` is
+    # `--dangerously-bypass-approvals-and-sandbox`, the explicit opt-out.
+    # Claude has no equivalent and ignores this.
+    "codex_sandbox": "approve-for-me",
     # Cost model: percent of the session window a single step is assumed to
     # burn before a repo has any measured history.
     "default_est_cost_pct": 6.0,

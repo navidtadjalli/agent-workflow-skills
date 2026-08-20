@@ -28,7 +28,8 @@ dispatch logs --daemon   # what the daemon is saying right now
 State lives under `~/.claude/dispatch/` (override with `DISPATCH_HOME`):
 
 ```
-config.json   thresholds, repo overrides, chat allowlist, projects root
+config.json   thresholds, repo overrides, chat allowlist, projects root,
+              codex sandbox mode
 queue.json    tasks
 state.json    governor snapshot · chat offset · per-lane mode and armed resume
               · chat transport health (last error, consecutive failures, when)
@@ -65,6 +66,7 @@ Config keys worth knowing (all optional; the rest are governor thresholds):
 chat_allowlist   chat ids allowed to drive the daemon. Empty means nobody.
 projects_root    where repos are discovered (default ~/Projects)
 repos            alias -> path, for repos outside that root
+codex_sandbox    how codex workers are confined (default approve-for-me)
 ```
 
 ## What the governor actually knows
@@ -131,4 +133,45 @@ daemon runs with no chat transport, printing why at startup and reporting it in
 starts, so the queue and `dispatch add` keep working while the allowlist is
 fixed -- a daemon that refused to start would just be relaunched by the watchdog
 every five minutes.
+
+**Codex workers run inside codex's own sandbox.** `codex_sandbox` selects the
+mode, and the default is `approve-for-me`: unattended, with approval requests
+routed through codex's automatic review, and the workspace confined to the repo
+the task names. The other values are `read-only`, `workspace-write`,
+`danger-full-access`, and `bypass` -- the last being
+`--dangerously-bypass-approvals-and-sandbox`, the previous behaviour, kept as an
+explicit opt-out for when a task genuinely needs it (network installs, work
+outside the workspace) or if the reviewed mode turns out to stall. It is one
+config value and a daemon restart, not a code change:
+
+```bash
+python3 - <<'EOF'
+import json, os
+path = os.path.expanduser("~/.claude/dispatch/config.json")
+cfg = json.load(open(path))
+cfg["codex_sandbox"] = "bypass"
+json.dump(cfg, open(path, "w"), indent=2, sort_keys=True)
+EOF
+dispatch down && dispatch up
+```
+
+One asymmetry: `codex exec resume` parses a narrower set of options than `codex
+exec` and accepts neither `-s` nor `--approve-for-me` (measured on codex-cli
+0.148.0). A continuation step therefore carries no sandbox flag at all unless
+`codex_sandbox` is `bypass`, and runs under codex's own default policy.
+
+Claude has no equivalent flag: `--dangerously-skip-permissions` is how a
+headless Claude worker runs unattended, and the confinement there is the repo it
+is pointed at.
+
+## Known issue: resumed codex steps
+
+`codex exec resume` also rejects the `-C <cwd>` that every step passes, with
+`error: unexpected argument '-C' found` and exit status 2 -- so a codex task
+that reports `continue` fails on its next step, before doing any work, with no
+status file to read. This predates the sandbox change and is not fixed here: the
+fix is to drop `-C` from the resume form (the worker already launches the
+process with its cwd set), and it needs one live codex step to confirm. Until
+then, codex tasks that need more than one step will land in `failed`; `dispatch
+logs <id>` shows the parse error. The claude lane is unaffected.
 

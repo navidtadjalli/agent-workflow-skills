@@ -37,9 +37,10 @@ def write_prompt(task, task_dir):
     return path
 
 
-def build_command(task, prompt_path, cwd, task_dir, unsafe=True):
+def build_command(task, prompt_path, cwd, task_dir, unsafe=True, config=None):
+    """``config`` carries `codex_sandbox`; only the codex backend reads it."""
     return backends.get(lanes.of(task)).build_command(
-        task, prompt_path, cwd, task_dir, unsafe=unsafe)
+        task, prompt_path, cwd, task_dir, unsafe=unsafe, config=config)
 
 
 def parse_status(output, task_dir, task=None):
@@ -75,7 +76,7 @@ def run_step(task, cwd, config, env=None, popen=None, sleeper=None, task_dir=Non
     # Before anything is launched: a status file left by the previous step must
     # not be readable as this one's result if this one dies without writing.
     backends.get(lanes.of(task)).reset(task_dir)
-    argv = build_command(task, prompt_path, cwd, task_dir)
+    argv = build_command(task, prompt_path, cwd, task_dir, config=config)
 
     with open(prompt_path) as prompt_handle:
         process = popen(argv, cwd=cwd, env=env or os.environ.copy(),

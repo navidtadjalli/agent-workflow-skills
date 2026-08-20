@@ -38,7 +38,11 @@ def resume_args(session_id):
     return ["--resume", session_id] if session_id else []
 
 
-def build_command(task, prompt_path, cwd, task_dir, unsafe=True):
+def build_command(task, prompt_path, cwd, task_dir, unsafe=True, config=None):
+    """``config`` is accepted and ignored: the backends share one signature,
+    and `claude` has no sandbox option to select. Confinement here is the repo
+    the worker is pointed at, and `--dangerously-skip-permissions` is what makes
+    it headless at all."""
     argv = ["claude", "-p", "-", "--output-format", "json"]
     if unsafe:
         argv.append("--dangerously-skip-permissions")

@@ -70,9 +70,30 @@ codex    codex exec [resume <sid>] - --json -C <cwd>
                 --skip-git-repo-check
                 --output-schema <pkg>/backends/status.schema.json
                 -o <tasks/<id>/last.json>
-                --dangerously-bypass-approvals-and-sandbox
+                --approve-for-me            (or -s <mode>, or the bypass
+                                             flag -- see codex_sandbox)
                                                         < prompt.txt
 ```
+
+The codex worker runs inside codex's sandbox rather than around it.
+`codex exec` offers a genuinely unattended confined mode: `--approve-for-me`
+routes approval requests through its own automatic review and holds the
+workspace to the directory `-C` names, which is the repo the task was queued
+against. That is the default, selected by the `codex_sandbox` config key.
+`read-only`, `workspace-write` and `danger-full-access` pass `-s` straight
+through, and `bypass` is `--dangerously-bypass-approvals-and-sandbox` -- the
+original behaviour, still reachable, because the confined mode has not been run
+against a live codex here and a mode that stalls waiting for an approval has to
+be recoverable by editing one value. An unrecognised value resolves to the
+default, not to the most permissive entry. Claude has no equivalent flag and the
+change is codex-only.
+
+`codex exec resume` parses a narrower option set than `codex exec` and rejects
+both `-s` and `--approve-for-me`, so a continuation step carries a sandbox flag
+only when the bypass was asked for explicitly. The same narrower parser also
+rejects the `-C <cwd>` in the argv above, which makes every resumed codex step
+exit 2 before it starts -- a defect that predates this and is documented in
+`references/operations.md` rather than fixed blind.
 
 Note that codex continuation is a subcommand (`codex exec resume <sid>`), not a
 trailing flag as it is for Claude (`--resume <sid>`). `resume_args` therefore
