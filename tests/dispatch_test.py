@@ -4,8 +4,10 @@
 No network, no subprocesses, no real clock. Every value the daemon would read
 from the world is injected, so these tests assert on the logic itself.
 """
+import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -20,6 +22,12 @@ from dispatch import backends, governor, lanes, parser, repos, scheduler, sessio
 
 CONFIG = config_mod.DEFAULTS
 MILLION = 1_000_000
+
+
+def _alternatives(pattern, group):
+    """The literal alternatives a named group in ``pattern`` accepts."""
+    match = re.search(r"\(\?P<%s>([^)]+)\)" % group, pattern.pattern)
+    return match.group(1).split("|") if match else []
 
 
 class TestParser(unittest.TestCase):
@@ -59,6 +67,34 @@ class TestParser(unittest.TestCase):
     def test_empty_is_unparsed(self):
         self.assertEqual(parser.parse("")["kind"], "unparsed")
         self.assertEqual(parser.parse(None)["kind"], "unparsed")
+
+
+    def test_every_kind_it_can_emit_is_declared_in_KINDS(self):
+        """KINDS is the contract the daemon's chat surface is checked against.
+
+        A kind that reaches the daemon without a branch falls through to
+        free-form intake and can answer with silence, so a new verb must not be
+        able to slip past the enumeration. Derived from the parser itself rather
+        than listed by hand: a hand-written list is exactly what drifts.
+        """
+        source = inspect.getsource(parser)
+        for literal in re.findall(r'"kind":\s*"([a-z_]+)"', source):
+            self.assertIn(literal, parser.KINDS, literal)
+
+        probes = list(parser.BARE)
+        probes += ["%s 1" % verb for verb in _alternatives(parser.WITH_ID, "verb")]
+        probes += ["%s %s" % (verb, lane)
+                   for verb in _alternatives(parser.LANE_MODE, "verb")
+                   for lane in _alternatives(parser.LANE_MODE, "lane")]
+        probes += ["%s tidy up on qpay" % agent
+                   for agent in _alternatives(parser.AGENT_RUN, "agent")]
+        probes += ["%s tidy up" % agent
+                   for agent in _alternatives(parser.AGENT_BARE, "agent")]
+        probes += ["usage poll", "sessions qpay", "run a thing on qpay",
+                   "anything else at all", ""]
+        self.assertGreater(len(probes), len(parser.KINDS))
+        for probe in probes:
+            self.assertIn(parser.parse(probe)["kind"], parser.KINDS, probe)
 
 
 class TestGovernorLadder(unittest.TestCase):
@@ -1403,6 +1439,115 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertEqual(polled, [])
         self.assertIn("floor", reply)
 
+    def test_a_pause_from_chat_is_not_reverted_by_the_same_tick(self):
+        """Telegram is the only surface the user has.
+
+        A control command that reports success and then quietly undoes itself is
+        worse than one that fails loudly: the lane keeps spending plan budget
+        and there is nowhere else to notice from.
+        """
+        daemon = self._daemon()
+        daemon.chat = _ScriptedChat("pause codex", update_id=7)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        doc = state.read_state()
+        self.assertEqual(doc["mode"][lanes.CODEX], "paused")
+        self.assertEqual(doc["mode"][lanes.CLAUDE], winddown.RUNNING)
+        self.assertIn("paused codex", daemon.chat.sent[0][1])
+
+    def test_a_chat_poll_result_is_not_reverted_by_the_same_tick(self):
+        """`usage poll` spends a real request; discarding its answer at the end
+        of the tick would spend it for nothing."""
+        daemon = self._daemon()
+        daemon.chat = _ScriptedChat("usage poll", update_id=7)
+        daemon.poll_usage = lambda: {"ok": True, "at": self.now, "session_pct": 44.0,
+                                     "session_reset": self.now + 3600,
+                                     "week_pct": 5.0, "week_reset": None}
+        with state.mutate_state() as doc:
+            # Past the poll floor but short of the idle interval, so the tick
+            # itself will not poll and the chat command's poll is the only one.
+            doc["governor"] = dict(governor.blank(), polled_at=self.now - 61,
+                                   session_pct=10.0, tokens_at_poll=0,
+                                   session_reset=self.now + 3600)
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "qpay", "work", agent="claude")
+        daemon.tick()
+        self.assertEqual(state.read_state()["governor"]["session_pct"], 44.0)
+
+    def test_a_codex_settle_does_not_force_a_claude_poll(self):
+        """A codex step spends no Claude budget, so its ending tells the Claude
+        governor nothing worth paying a request to confirm."""
+        daemon = self._daemon()
+        polled = []
+        original = daemon.poll_usage
+        daemon.poll_usage = lambda: polled.append(1) or original()
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "poook", "codex work", agent="codex")
+        daemon.tick()
+        self.assertEqual(len(polled), 1)  # the first tick has never polled
+        self.assertEqual(state.read_queue()["tasks"][0]["state"], "done")
+        self.now += 61  # past poll_floor, well short of poll_idle
+        daemon.tick()
+        self.assertEqual(len(polled), 1)
+
+    def test_a_running_codex_worker_does_not_make_the_claude_poll_hot(self):
+        """`hot` shortens the interval before the next paid Claude poll. A busy
+        codex lane is not a reason to spend a Claude request sooner."""
+        daemon = self._daemon()
+        daemon.executor = _NeverFinishes()
+        polled = []
+        original = daemon.poll_usage
+        daemon.poll_usage = lambda: polled.append(1) or original()
+        with state.mutate_queue() as queue:
+            state.new_task(queue, "poook", "codex work", agent="codex")
+        daemon.tick()
+        self.assertEqual(len(polled), 1)
+        self.assertEqual(len(daemon.running), 1)
+        self.now += 200  # past poll_hot (180), short of poll_idle (600)
+        daemon.tick()
+        self.assertEqual(len(polled), 1)
+
+    def test_a_frozen_codex_lane_does_not_spend_claude_requests(self):
+        """The codex reading comes free from disk and no `/usage` call can
+        refresh it, so an unconfirmed codex resume timer must not arm a Claude
+        poll -- while the lane is frozen its percentage cannot fall, so the
+        timer would re-arm every tick and leak a request per poll_floor forever.
+        """
+        daemon = self._daemon(codex_pct=99.0)
+        polled = []
+        original = daemon.poll_usage
+        daemon.poll_usage = lambda: polled.append(1) or original()
+        with state.mutate_state() as doc:
+            doc["mode"][lanes.CODEX] = winddown.FROZEN
+            doc["armed_resume_at"][lanes.CODEX] = self.now - 10
+            doc["governor"] = dict(governor.blank(), polled_at=self.now - 61,
+                                   session_pct=10.0, tokens_at_poll=0,
+                                   session_reset=self.now + 3600)
+        daemon.tick()
+        daemon.tick()
+        self.assertEqual(polled, [])
+        self.assertEqual(state.read_state()["mode"][lanes.CODEX], winddown.FROZEN)
+
+    def test_the_volume_report_is_called_and_its_failure_surfaces(self):
+        """volume skips a log it cannot read and carries on. The daemon must not
+        also swallow a report that fails outright."""
+        daemon = self._daemon()
+        # Drop the empty-log seam this harness installs, so the real method runs.
+        del daemon.volume_block
+        readings = {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                               "source": "measured", "resets_at": None},
+                    "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                              "source": "codex-logs", "resets_at": None}}
+        with mock.patch.object(volume, "render", return_value="VOLUME") as render:
+            reply = daemon.usage_reply(False, governor.blank(), readings, self.now, 0)
+        render.assert_called_once_with(self.now)
+        self.assertIn("VOLUME", reply)
+        with mock.patch.object(volume, "render", side_effect=OSError("bad log")):
+            reply = daemon.usage_reply(False, governor.blank(), readings, self.now, 0)
+        self.assertIn("volume report unavailable", reply)
+        self.assertIn("bad log", reply)
+
     def test_every_parser_kind_gets_a_reply(self):
         """Silence is the worst reply a chat surface can give.
 
@@ -1416,12 +1561,8 @@ class TestTwoLaneDaemon(unittest.TestCase):
                    "resume claude", "cancel 1", "logs 1", "retry 1",
                    "claude fix the auth test", "claude tidy up on qpay",
                    "run the migration on qpay", "hello there", "", "   "]
-        expected = {"status", "queue", "usage", "help", "repos", "sessions",
-                    "pause", "resume", "cancel", "logs", "retry", "need_repo",
-                    "run", "unparsed"}
         covered = {parser.parse(text)["kind"] for text in samples}
-        self.assertEqual(covered, expected)
-        self.assertTrue(set(parser.BARE.values()) <= expected)
+        self.assertEqual(covered, set(parser.KINDS))
 
         daemon = self._daemon()
         daemon.freeform = lambda text: (None, "no model in tests")

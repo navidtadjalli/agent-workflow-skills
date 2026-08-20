@@ -41,6 +41,13 @@ BARE = {
 }
 ISOLATION = re.compile(r"\s+(?:in\s+a\s+)?worktree\s*$", re.IGNORECASE)
 
+# Every kind ``parse`` can return, declared rather than inferred. The daemon's
+# chat surface must have a branch for each: a kind with no branch falls through
+# to free-form intake, which answers with nothing when there is no text -- and
+# on a chat surface, silence is indistinguishable from a dropped message.
+KINDS = ("cancel", "help", "logs", "need_repo", "pause", "queue", "repos",
+         "resume", "retry", "run", "sessions", "status", "unparsed", "usage")
+
 
 def normalize_id(raw):
     """``7``, ``t-7`` and ``t-0007`` all name the same task."""

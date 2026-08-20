@@ -146,30 +146,30 @@ class Daemon:
 
     def tick(self):
         now = self.clock()
-        state_doc = state.read_state()
-        snapshot = state_doc.get("governor") or governor.blank()
+        snapshot = state.read_state().get("governor") or governor.blank()
         tokens = self.count_tokens()
 
-        hot = bool(self.running)
+        # `hot` and `_force_poll` are Claude-only machinery: both shorten the
+        # wait before we spend a request on `/usage`. Only Claude work moves the
+        # Claude window, so only Claude work may shorten it.
+        hot = bool(self._running_in(lanes.CLAUDE))
         if governor.should_poll(snapshot, now, hot=hot, force=self._force_poll,
                                 config=self.config):
             snapshot = governor.record_poll(snapshot, self.poll_usage(), tokens)
             self._force_poll = False
+            with state.mutate_state() as doc:
+                doc["governor"] = snapshot
 
         readings = {
             lanes.CLAUDE: governor.estimate(snapshot, now, tokens),
             lanes.CODEX: self.codex_estimate(now),
         }
-        # From here on the document is the single authority: a limit error
-        # discovered while settling a step must not be overwritten by the
-        # pre-settle snapshot.
-        state_doc["governor"] = snapshot
 
         # Settle anything that finished since the last tick, then decide each
         # lane's mode from the world as it is now.
-        if self._reap(state_doc, snapshot):
+        if lanes.CLAUDE in self._reap(snapshot):
             self._force_poll = True
-        modes = self._apply_modes(state_doc, snapshot, readings, now, tokens)
+        modes = self._apply_modes(snapshot, readings, now, tokens)
 
         self._intake(modes, readings, snapshot, now, tokens)
         for lane in lanes.ALL:
@@ -179,43 +179,53 @@ class Daemon:
         # A step can also finish within this tick -- always with the inline
         # executor, occasionally with a fast real step. Settling it here rather
         # than a whole interval later keeps the queue moving.
-        if self._reap(state_doc, snapshot):
+        settled = self._reap(snapshot)
+        if lanes.CLAUDE in settled:
             self._force_poll = True
-            modes = self._apply_modes(state_doc, snapshot, readings, now, tokens)
+        if settled:
+            modes = self._apply_modes(snapshot, readings, now, tokens)
 
         return {"mode": modes, "readings": readings, "running": sorted(self.running)}
 
-    def _apply_modes(self, state_doc, snapshot, readings, now, tokens):
+    def _apply_modes(self, snapshot, readings, now, tokens):
         """Advance each lane's wind-down machine and persist the result.
 
-        Only the three fields the tick owns are written back. ``state_doc`` was
-        read before intake ran, and intake advances ``chat_offset`` through its
-        own read-modify-write -- writing this copy whole would rewind the chat
-        cursor and replay every command that arrived during the tick.
+        The whole read-modify-write happens under the state lock and seeds from
+        the live document, never from a copy taken at the top of the tick.
+        Intake runs between the two calls to this method and writes these very
+        fields -- `pause`/`resume` set a lane's mode, `usage poll` replaces the
+        governor snapshot -- so a tick carrying its own copy forward would
+        acknowledge a chat command and then silently undo it. On the only
+        surface the user has, that is worse than refusing outright.
+
+        Notices are buffered and sent after the lock is released: ``notify``
+        reaches the network, and no chat round trip belongs inside a flock.
         """
-        modes = dict(state_doc["mode"])
-        for lane in lanes.ALL:
-            modes[lane] = self._apply_lane_mode(
-                state_doc, lane, snapshot, readings[lane], now, tokens)
-        state_doc["mode"] = modes
+        notices = []
         with state.mutate_state() as doc:
+            modes = {}
+            for lane in lanes.ALL:
+                modes[lane] = self._apply_lane_mode(
+                    doc, lane, snapshot, readings[lane], now, tokens, notices)
             doc["mode"] = modes
-            doc["armed_resume_at"] = dict(state_doc["armed_resume_at"])
-            doc["governor"] = state_doc["governor"]
+        for text in notices:
+            self.notify(text)
         return modes
 
-    def _apply_lane_mode(self, state_doc, lane, snapshot, reading, now, tokens):
+    def _apply_lane_mode(self, doc, lane, snapshot, reading, now, tokens, notices):
         """The same state machine as before, over one lane's tasks only."""
         running = self._running_in(lane)
-        previous = state_doc["mode"][lane]
+        previous = doc["mode"][lane]
+        summary = self._lane_summary(lane, doc.get("governor") or snapshot,
+                                     reading, now, tokens)
         mode = winddown.next_mode(previous, reading["session_pct"], running,
                                   self.config, reading["stale"])
 
         if mode == winddown.FROZEN and previous != winddown.FROZEN:
             armed = winddown.resume_at(reading.get("resets_at"))
-            state_doc["armed_resume_at"][lane] = armed
-            self.notify("%s frozen at %s · %s" % (
-                lane, self._lane_summary(lane, snapshot, reading, now, tokens),
+            doc["armed_resume_at"][lane] = armed
+            notices.append("%s frozen at %s · %s" % (
+                lane, summary,
                 "resumes ~%s" % self._reset_text(reading) if armed else
                 "resume not scheduled"))
 
@@ -224,17 +234,21 @@ class Daemon:
             # shape, so it is handed this lane's two fields rather than the
             # document they now live in.
             allowed, _ = winddown.can_resume(
-                {"mode": mode, "armed_resume_at": state_doc["armed_resume_at"][lane]},
+                {"mode": mode, "armed_resume_at": doc["armed_resume_at"][lane]},
                 reading["session_pct"], now, self.config, reading["stale"])
             if allowed:
                 mode = winddown.RUNNING
-                state_doc["armed_resume_at"][lane] = None
-                self.notify("%s resumed · %s" % (
-                    lane, self._lane_summary(lane, snapshot, reading, now, tokens)))
-            elif (state_doc["armed_resume_at"][lane]
-                  and now >= state_doc["armed_resume_at"][lane]):
+                doc["armed_resume_at"][lane] = None
+                notices.append("%s resumed · %s" % (lane, summary))
+            elif (lane == lanes.CLAUDE
+                  and doc["armed_resume_at"][lane]
+                  and now >= doc["armed_resume_at"][lane]):
                 # The timer fired but the window has not actually rolled over.
                 # Confirm with a real poll next tick rather than trusting it.
+                # Claude only: nothing a `/usage` call returns can refresh a
+                # codex reading, and a frozen codex lane's percentage cannot
+                # fall on its own, so this would re-arm forever and leak a
+                # request per poll_floor on the lane designed to be free.
                 self._force_poll = True
         return mode
 
@@ -540,13 +554,18 @@ class Daemon:
         }
         return True
 
-    def _reap(self, state_doc, snapshot):
-        """Collect finished steps and decide each task's next state."""
-        finished = []
+    def _reap(self, snapshot):
+        """Collect finished steps. Returns the set of lanes that settled one.
+
+        The caller needs the lanes, not the task ids: a Claude step ending is
+        the moment the Claude estimate is least trustworthy and worth a poll,
+        while a codex step ending changes nothing a free disk read will not.
+        """
+        settled = set()
         for task_id, entry in list(self.running.items()):
             if not entry["future"].done():
                 continue
-            finished.append(task_id)
+            settled.add(lanes.of(entry["task"]))
             self.running.pop(task_id, None)
             state.release(entry["lock"])
             try:
@@ -555,23 +574,30 @@ class Daemon:
                 result = {"status": None, "summary": "", "next": "",
                           "output": str(exc), "limit_reset_at": None,
                           "session_id": None, "timed_out": False}
-            self._settle(task_id, entry, result, state_doc, snapshot)
-        return finished
+            self._settle(task_id, entry, result, snapshot)
+        return settled
 
-    def _settle(self, task_id, entry, result, state_doc, snapshot):
+    def _settle(self, task_id, entry, result, snapshot):
         task = entry["task"]
         lane = lanes.of(task)
 
         if result.get("limit_reset_at"):
-            # Only the Claude governor carries an override; the codex lane
-            # re-reads its own limits from disk next tick and self-corrects.
-            if lane == lanes.CLAUDE:
-                state_doc["governor"] = governor.note_limit_error(
-                    state_doc.get("governor") or snapshot, result["limit_reset_at"])
-            state_doc["mode"][lane] = winddown.FROZEN
-            state_doc["armed_resume_at"][lane] = winddown.resume_at(
-                result["limit_reset_at"])
+            # Written straight through under the lock rather than staged on the
+            # tick's copy: _apply_modes seeds from the live document, so a
+            # freeze parked in a copy would simply not be there when it looked.
+            with state.mutate_state() as doc:
+                # Only the Claude governor carries an override; the codex lane
+                # re-reads its own limits from disk next tick and self-corrects.
+                if lane == lanes.CLAUDE:
+                    doc["governor"] = governor.note_limit_error(
+                        doc.get("governor") or snapshot, result["limit_reset_at"])
+                doc["mode"][lane] = winddown.FROZEN
+                doc["armed_resume_at"][lane] = winddown.resume_at(
+                    result["limit_reset_at"])
 
+        # After the freeze above and after intake, so a step that finished into
+        # a lane the user just paused is paused rather than requeued.
+        mode = state.read_state()["mode"][lane]
         summary = (result.get("summary") or "").strip()
         message = "%s step %d: %s" % (task_id, task.get("steps_done", 0) + 1,
                                       summary or "checkpoint")
@@ -602,8 +628,7 @@ class Daemon:
                 record["state"] = "paused"
                 record["last_error"] = "usage limit"
             else:
-                record["state"] = worker_next_state(result.get("status"),
-                                                    state_doc["mode"][lane])
+                record["state"] = worker_next_state(result.get("status"), mode)
                 if record["state"] == "failed":
                     record["last_error"] = "no status block from worker"
             settled = dict(record)

@@ -57,9 +57,13 @@ class DispatchIntegration(unittest.TestCase):
         root = self.tmp.name
         self.home = os.path.join(root, "dispatch-home")
         self.repo = os.path.join(root, "demo-repo")
+        # A second checkout, so a lane blocked on `demo` has somewhere else to
+        # go and "did the lane stall?" is answerable rather than assumed.
+        self.repo2 = os.path.join(root, "other-repo")
         bin_dir = os.path.join(root, "bin")
         os.makedirs(bin_dir)
         os.makedirs(self.repo)
+        os.makedirs(self.repo2)
         # Repo discovery points here, so it never enumerates the real ~/Projects.
         os.makedirs(os.path.join(root, "empty-root"))
 
@@ -83,11 +87,12 @@ class DispatchIntegration(unittest.TestCase):
             "DISPATCH_TOKEN_ENV": os.path.join(root, "absent.env"),
         })
 
-        self._git("init", "-q")
-        with open(os.path.join(self.repo, "README.md"), "w") as fh:
-            fh.write("fixture\n")
-        self._git("add", "-A")
-        self._git("commit", "-qm", "initial")
+        for repo in (self.repo, self.repo2):
+            self._git("init", "-q", cwd=repo)
+            with open(os.path.join(repo, "README.md"), "w") as fh:
+                fh.write("fixture\n")
+            self._git("add", "-A", cwd=repo)
+            self._git("commit", "-qm", "initial", cwd=repo)
         self.now = 1_776_000_000.0
 
     def tearDown(self):
@@ -95,8 +100,8 @@ class DispatchIntegration(unittest.TestCase):
         os.environ.update(self._env)
         self.tmp.cleanup()
 
-    def _git(self, *args):
-        return subprocess.run(["git"] + list(args), cwd=self.repo,
+    def _git(self, *args, cwd=None):
+        return subprocess.run(["git"] + list(args), cwd=cwd or self.repo,
                               capture_output=True, text=True, check=False)
 
     def _daemon(self, session_pct=10.0, codex_pct=5.0, **over):
@@ -110,7 +115,8 @@ class DispatchIntegration(unittest.TestCase):
         return daemon_mod.Daemon(
             # An empty projects root, so discovery never sees the real ~/Projects.
             config={"projects_root": os.path.join(self.tmp.name, "empty-root"),
-                    "repos": {"demo": self.repo}, "chat_allowlist": []},
+                    "repos": {"demo": self.repo, "other": self.repo2},
+                    "chat_allowlist": []},
             clock=lambda: self.now,
             poll_usage=lambda: reading,
             count_tokens=lambda: 0,
@@ -119,9 +125,9 @@ class DispatchIntegration(unittest.TestCase):
             executor=daemon_mod.InlineExecutor(),
             **over)
 
-    def _enqueue(self, prompt="do the thing", agent="claude"):
+    def _enqueue(self, prompt="do the thing", agent="claude", repo="demo"):
         with state.mutate_queue() as queue:
-            return state.new_task(queue, "demo", prompt, agent=agent)
+            return state.new_task(queue, repo, prompt, agent=agent)
 
     def _modes(self, claude="running", codex="running"):
         return {lanes.CLAUDE: claude, lanes.CODEX: codex}
@@ -289,10 +295,20 @@ class DispatchIntegration(unittest.TestCase):
         self.assertEqual(result["mode"]["codex"], "running")
 
     def test_lanes_contend_for_one_repo(self):
-        """A claude worker and a codex worker must not share a checkout."""
+        """A claude worker and a codex worker must not share a checkout.
+
+        The third task is what makes this a test rather than a tautology.
+        `flock` alone would produce `started == ["t-0001"]` even with a per-lane
+        lock set, because a second `LOCK_EX|LOCK_NB` on a fresh descriptor is
+        denied within one process too. What the shared set actually buys is that
+        `t-0002` is refused at *admission* and stepped over, so `t-0003` in
+        another checkout still gets its turn -- rather than reaching `_start`,
+        failing the flock, and ending the lane's dispatch pass.
+        """
         os.environ["STUB_MODE"] = "continue"
         self._enqueue("first", agent="claude")
         self._enqueue("second", agent="codex")
+        self._enqueue("third", agent="codex", repo="other")
         daemon = self._daemon()
         started = []
         original = daemon.run_step
@@ -303,11 +319,18 @@ class DispatchIntegration(unittest.TestCase):
 
         daemon.run_step = watched
         daemon.tick()
-        self.assertEqual(started, ["t-0001"])
+        self.assertEqual(started, ["t-0001", "t-0003"])
 
-    def test_codex_admitted_on_a_stale_but_unexpired_reading(self):
-        """A codex percentage is only as fresh as the last codex run, and waiting
-        cannot improve it -- so age alone must never block the lane."""
+    def test_codex_admitted_on_a_reading_whose_window_has_not_reset(self):
+        """A pending `resets_at` is not a reason to hold the lane back.
+
+        Deliberately not a staleness test: `governor.codex` guarantees `stale`
+        is always False, because a codex percentage is only as fresh as the last
+        codex run and the only way to improve it is to run codex. Injecting
+        `stale: True` here would assert against that guarantee rather than for
+        it, so what is pinned is the neighbouring gate -- a future reset
+        timestamp passes admission untouched.
+        """
         task = self._enqueue("codex work", agent="codex")
         daemon = self._daemon(codex_reading={
             "session_pct": 20.0, "week_pct": 0.0, "source": "codex-logs",
