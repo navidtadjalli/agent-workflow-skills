@@ -1537,6 +1537,14 @@ class TestAgentVerbs(unittest.TestCase):
 
 
 class TestReadVerbs(unittest.TestCase):
+    def test_ping_parses_bare_and_case_insensitively(self):
+        for text in ("ping", "PING", "/ping", "  ping  "):
+            self.assertEqual(parser.parse(text)["kind"], "ping", text)
+
+    def test_ping_with_trailing_words_is_not_a_ping(self):
+        """`ping the server` is free-form, not a connectivity check."""
+        self.assertNotEqual(parser.parse("ping the server")["kind"], "ping")
+
     def test_usage_is_free_by_default(self):
         command = parser.parse("usage")
         self.assertEqual(command["kind"], "usage")
@@ -1786,6 +1794,35 @@ class TestTwoLaneDaemon(unittest.TestCase):
             os.environ.pop("DISPATCH_HOME", None)
         else:
             os.environ["DISPATCH_HOME"] = self._previous
+
+    def test_ping_answers_pong(self):
+        daemon = self._daemon()
+        self.assertEqual(daemon.handle_command(
+            "ping", {"claude": "running", "codex": "running"},
+            {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                        "source": "measured", "resets_at": None},
+             "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                       "source": "codex-logs", "resets_at": None}},
+            governor.blank(), self.now, 0), "pong")
+
+    def test_ping_answers_even_when_everything_else_would_raise(self):
+        """ping is what you send when you do not know the daemon is alive.
+
+        Every other argument is poisoned here: no readings, no modes, a
+        snapshot that is not a dict, and a clock that raises. Any command that
+        consults state, the governor, or the volume report would blow up on
+        these; ping must not, because the moment you need it is the moment the
+        rest of the surface is broken.
+        """
+        daemon = self._daemon()
+
+        def exploding_clock():
+            raise AssertionError("ping must not read the clock")
+
+        daemon.clock = exploding_clock
+        daemon.volume_block = lambda now: 1 / 0
+        self.assertEqual(daemon.handle_command("ping", {}, {}, None, None, None),
+                         "pong")
 
     def _daemon(self, claude_pct=10.0, codex_pct=10.0, run_step=None,
                 checkpoint=None):
@@ -2122,7 +2159,7 @@ class TestTwoLaneDaemon(unittest.TestCase):
         and used to fall through to free-form intake -- must answer with
         something.
         """
-        samples = ["status", "queue", "usage", "usage poll", "help", "repos",
+        samples = ["ping", "status", "queue", "usage", "usage poll", "help", "repos",
                    "sessions", "sessions qpay", "pause", "resume", "pause codex",
                    "resume claude", "cancel 1", "logs 1", "retry 1",
                    "claude fix the auth test", "claude tidy up on qpay",

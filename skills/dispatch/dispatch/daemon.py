@@ -447,6 +447,13 @@ class Daemon:
         command = parser.parse(text)
         kind = command["kind"]
 
+        # First, and deliberately before anything that reads state, the
+        # governor, or the disk: ping is what you send when you do not know
+        # whether the daemon is alive, so it must not be able to fail for any
+        # reason the rest of the surface can.
+        if kind == "ping":
+            return "pong"
+
         if kind == "usage":
             return self.usage_reply(command.get("poll"), snapshot, readings,
                                     now, tokens)
@@ -460,7 +467,8 @@ class Daemon:
             return repos.render(self.found_repos())
         if kind == "help":
             return ("claude <task> on <repo> · codex <task> on <repo> · "
-                    "status · queue · usage · usage poll · sessions · repos · "
+                    "ping · status · queue · usage · usage poll · "
+                    "sessions · repos · "
                     "logs <id> · cancel <id> · retry <id> · "
                     "pause [lane] · resume [lane]")
         if kind in ("pause", "resume"):

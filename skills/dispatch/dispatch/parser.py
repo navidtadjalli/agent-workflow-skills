@@ -28,6 +28,7 @@ LANE_MODE = re.compile(r"^(?P<verb>pause|resume)\s+(?P<lane>claude|codex)\s*$",
 WITH_ID = re.compile(
     r"^(?P<verb>cancel|logs|log|show|retry)\s+(?P<id>t-?\d+|\d+)\s*$", re.IGNORECASE)
 BARE = {
+    "ping": "ping",
     "status": "status",
     "queue": "queue",
     "q": "queue",
@@ -45,8 +46,9 @@ ISOLATION = re.compile(r"\s+(?:in\s+a\s+)?worktree\s*$", re.IGNORECASE)
 # chat surface must have a branch for each: a kind with no branch falls through
 # to free-form intake, which answers with nothing when there is no text -- and
 # on a chat surface, silence is indistinguishable from a dropped message.
-KINDS = ("cancel", "help", "logs", "need_repo", "pause", "queue", "repos",
-         "resume", "retry", "run", "sessions", "status", "unparsed", "usage")
+KINDS = ("cancel", "help", "logs", "need_repo", "pause", "ping", "queue",
+         "repos", "resume", "retry", "run", "sessions", "status", "unparsed",
+         "usage")
 
 
 def normalize_id(raw):
