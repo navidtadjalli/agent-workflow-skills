@@ -29,6 +29,13 @@ WITH_ID = re.compile(
     r"^(?P<verb>cancel|logs|log|show|retry)\s+(?P<id>t-?\d+|\d+)\s*$", re.IGNORECASE)
 BARE = {
     "ping": "ping",
+    # Answers to a free-form proposal. Bare `cancel` is deliberately not one:
+    # `cancel <id>` already means something else, and a one-word overlap on a
+    # destructive verb is not worth the convenience.
+    "yes": "confirm",
+    "y": "confirm",
+    "no": "deny",
+    "n": "deny",
     "status": "status",
     "queue": "queue",
     "q": "queue",
@@ -46,9 +53,9 @@ ISOLATION = re.compile(r"\s+(?:in\s+a\s+)?worktree\s*$", re.IGNORECASE)
 # chat surface must have a branch for each: a kind with no branch falls through
 # to free-form intake, which answers with nothing when there is no text -- and
 # on a chat surface, silence is indistinguishable from a dropped message.
-KINDS = ("cancel", "help", "logs", "need_repo", "pause", "ping", "queue",
-         "repos", "resume", "retry", "run", "sessions", "status", "unparsed",
-         "usage")
+KINDS = ("cancel", "confirm", "deny", "help", "logs", "need_repo", "pause",
+         "ping", "queue", "repos", "resume", "retry", "run", "sessions",
+         "status", "unparsed", "usage")
 
 
 def normalize_id(raw):

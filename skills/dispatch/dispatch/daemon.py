@@ -36,6 +36,10 @@ PARSE_PROMPT = (
 # How many times stored free-form text may be re-parsed before it is handed
 # back to the user. A parse that fails deterministically would otherwise be
 # retried on every tick, forever, at one request each.
+# How long a free-form proposal stays answerable. A `yes` typed hours later
+# should not queue work the sender has stopped thinking about.
+PENDING_TTL = 600
+
 PARSE_ATTEMPTS = 3
 
 # Bytes of crash log kept before one rollover to `daemon.log.1`.
@@ -411,7 +415,7 @@ class Daemon:
                 doc["chat_offset"] = next_offset
         for message in messages:
             reply = self.handle_command(message["text"], modes, readings, snapshot,
-                                        now, tokens)
+                                        now, tokens, chat_id=message["chat_id"])
             if reply:
                 self.chat.send(message["chat_id"], reply)
 
@@ -443,7 +447,8 @@ class Daemon:
         elif current.get("chat_last_error"):
             print("chat transport recovered", file=sys.stderr)
 
-    def handle_command(self, text, modes, readings, snapshot, now, tokens):
+    def handle_command(self, text, modes, readings, snapshot, now, tokens,
+                       chat_id=None):
         command = parser.parse(text)
         kind = command["kind"]
 
@@ -468,9 +473,14 @@ class Daemon:
         if kind == "help":
             return ("claude <task> on <repo> · codex <task> on <repo> · "
                     "ping · status · queue · usage · usage poll · "
+                    "yes / no (answer a proposal) · "
                     "sessions · repos · "
                     "logs <id> · cancel <id> · retry <id> · "
                     "pause [lane] · resume [lane]")
+        if kind == "confirm":
+            return self.confirm_pending(chat_id, modes, readings, now)
+        if kind == "deny":
+            return self.discard_pending(chat_id)
         if kind in ("pause", "resume"):
             return self.set_mode(kind, command.get("lane"))
         if kind == "cancel":
@@ -490,8 +500,9 @@ class Daemon:
             return self.enqueue(command["repo"], command["prompt"],
                                 command.get("isolation", "repo"),
                                 modes[lane], readings[lane], agent=lane)
-        reply = self.enqueue_freeform(command.get("text", ""),
-                                      modes[lanes.CLAUDE], readings[lanes.CLAUDE])
+        reply = self.propose_freeform(command.get("text", ""),
+                                      modes[lanes.CLAUDE], readings[lanes.CLAUDE],
+                                      chat_id, now)
         # An empty reply is indistinguishable from a dropped message, and a
         # chat surface that sometimes says nothing is worse than one that says
         # something useless. Every kind the parser emits lands somewhere.
@@ -511,32 +522,115 @@ class Daemon:
         return "%s · %s" % (parser.render_ack(task["id"], mode,
                                               self._reset_text(reading)), agent)
 
-    def enqueue_freeform(self, text, mode, reading):
-        """Free-form intake. Never lost, even when the parse itself is blocked."""
+    def propose_freeform(self, text, mode, reading, chat_id, now):
+        """Free-form intake. Parsed into work, then offered back for a yes.
+
+        It used to queue straight from the parse. That made a typo
+        indistinguishable from a request: a stray word became a model call and
+        then an unattended agent with permission prompts disabled, running in a
+        real repository. Proposing first costs one message and removes the
+        whole class.
+
+        Storage while the window is exhausted is unchanged in spirit -- the
+        daemon never stops accepting -- but what comes back after the reset is
+        a proposal too, not a queued task.
+        """
         if not text:
             return None
         if mode != winddown.RUNNING:
             with state.mutate_queue() as queue:
                 task = state.new_task(queue, "?", text)
                 task["state"] = "needs_parse"
-            return "stored %s · %s · parsed after reset" % (task["id"], mode)
+            return "stored %s · %s · I will propose it after the reset" % (
+                task["id"], mode)
         tasks, error = self.freeform(text)
         if not tasks:
-            with state.mutate_queue() as queue:
-                task = state.new_task(queue, "?", text)
-                task["state"] = "needs_parse"
-                task["last_error"] = error
-            return "stored %s · could not parse now (%s) · retrying" % (
-                task["id"], error)
-        ids = []
+            return "parsed as: nothing usable (%s) · send `help` for what I " \
+                   "understand, or `claude <task> on <repo>`" % error
+        usable, rejected = self.vet(tasks)
+        if not usable:
+            return "parsed as: nothing dispatchable · %s" % " · ".join(rejected)
+        self.store_pending(chat_id, usable, text, now)
+        return self.render_proposal(usable, rejected)
+
+    def vet(self, tasks):
+        """Split a parsed batch into what can actually run and what cannot.
+
+        Checked here rather than at `yes`, because a proposal naming a repo
+        that does not resolve asks the sender to approve work that cannot
+        start. The model is constrained to the dispatchable list by the parse
+        prompt but cannot be made to obey it, and a folder renamed between the
+        store and the parse is enough on its own.
+        """
+        found = self.found_repos()
+        usable, rejected = [], []
         for item in tasks:
-            reply = self.enqueue(item["repo"], item["prompt"], "repo", mode, reading,
-                                 agent=lanes.CLAUDE)
-            if reply.startswith("queued"):
-                ids.append(reply.split()[1])
+            if repos.resolve(item.get("repo"), found=found) is None:
+                rejected.append(repos.reject_reason(item.get("repo"), found))
             else:
-                return reply
-        return "queued %s · %s" % (", ".join(ids), mode)
+                usable.append(item)
+        return usable, rejected
+
+    def render_proposal(self, tasks, rejected=()):
+        lines = ["parsed as:"]
+        for item in tasks:
+            lines.append("  claude \"%s\" on %s" % (item["prompt"], item["repo"]))
+        for reason in rejected:
+            lines.append("  skipping · %s" % reason)
+        lines.append("reply `yes` to queue, `no` to drop")
+        return "\n".join(lines)
+
+    def store_pending(self, chat_id, tasks, text, now):
+        """Park a proposal for one chat. One outstanding proposal per chat:
+        a second one replaces the first, so `yes` can never be ambiguous."""
+        with state.mutate_state() as doc:
+            doc.setdefault("pending_confirm", {})[str(chat_id)] = {
+                "tasks": tasks, "at": now, "text": text}
+
+    def take_pending(self, chat_id, now):
+        """Pop a live proposal. Returns ``(tasks, reason)``; tasks is None on
+        nothing-to-confirm or expiry, and an expired one is cleared as it is
+        read so the next `yes` says the same thing rather than a stale one."""
+        key = str(chat_id)
+        doc = state.read_state()
+        pending = (doc.get("pending_confirm") or {}).get(key)
+        if not pending:
+            return None, "nothing to confirm"
+        expired = now - (pending.get("at") or 0) > PENDING_TTL
+        with state.mutate_state() as live:
+            (live.get("pending_confirm") or {}).pop(key, None)
+        if expired:
+            return None, "that proposal expired · send it again"
+        return pending.get("tasks") or None, None
+
+    def confirm_pending(self, chat_id, modes, readings, now):
+        tasks, reason = self.take_pending(chat_id, now)
+        if not tasks:
+            return reason
+        lane = lanes.CLAUDE
+        queued, rejected = [], None
+        for item in tasks:
+            reply = self.enqueue(item["repo"], item["prompt"], "repo",
+                                 modes[lane], readings[lane], agent=lane)
+            if reply.startswith("queued"):
+                queued.append(reply.split()[1])
+            else:
+                rejected = reply
+                break
+        if rejected and not queued:
+            return rejected
+        if rejected:
+            return "queued %s · then stopped: %s" % (", ".join(queued), rejected)
+        return "queued %s" % ", ".join(queued)
+
+    def discard_pending(self, chat_id):
+        key = str(chat_id)
+        doc = state.read_state()
+        if not (doc.get("pending_confirm") or {}).get(key):
+            return "nothing to drop"
+        with state.mutate_state() as live:
+            (live.get("pending_confirm") or {}).pop(key, None)
+        return "dropped"
 
     def parse_pending(self, mode, reading, limit=1):
         """Re-parse anything stored while the window was exhausted.
@@ -571,37 +665,27 @@ class Daemon:
                                 "attempts (%s) · send it again as `claude "
                                 "<task> on <repo>`" % (task["id"], attempts, error))
                 continue
-            # `enqueue` reports a repo it cannot resolve by *returning* the
-            # reason -- it neither raises nor queues. Discarding that marked
-            # the stored text `parsed` with nothing queued and nothing said,
-            # and `queue` hides `parsed` by default: the request the user was
-            # promised would be "parsed after reset" disappeared from every
-            # surface. A folder renamed between the store and the parse is all
-            # it takes; the parse prompt constrains the model to the
-            # dispatchable list but cannot make it obey.
-            queued, rejected = [], None
-            for item in tasks:
-                reply = self.enqueue(item["repo"], item["prompt"], "repo", mode,
-                                     reading, agent=lanes.CLAUDE)
-                if reply.startswith("queued"):
-                    queued.append(reply.split()[1])
-                else:
-                    rejected = reply
-                    break
+            # The parse succeeded, so the stored text has done its job. What
+            # comes back is a proposal, not a queued task: text stored while
+            # the window was exhausted is exactly the text nobody has looked
+            # at since, and queueing it unattended after a reset is the
+            # surprise this whole path exists to remove.
+            usable, rejected = self.vet(tasks)
             with state.mutate_queue() as queue:
                 record = state.find(queue, task["id"])
                 if record is not None:
-                    record["state"] = "blocked" if rejected else "parsed"
-                    record["last_error"] = rejected
-            if rejected:
-                # Blocked rather than left to retry: whatever came before the
-                # rejection is already queued, and re-parsing the same text
-                # would queue it a second time. One honest failure beats
-                # duplicate unattended work.
-                self.notify("%s blocked · %s%s" % (
-                    task["id"], rejected,
-                    " · queued %s before that" % ", ".join(queued) if queued
-                    else " · nothing queued"))
+                    record["state"] = "parsed" if usable else "blocked"
+                    record["last_error"] = None if usable else " · ".join(rejected)
+            if not usable:
+                # Blocked rather than left to retry: the text parsed fine, the
+                # repo it named is the problem, and re-parsing cannot fix that.
+                self.notify("%s blocked · nothing dispatchable · %s" % (
+                    task["id"], " · ".join(rejected)))
+                continue
+            for chat_id in self.config.get("chat_allowlist") or []:
+                self.store_pending(chat_id, usable, task["prompt"], self.clock())
+            self.notify("%s parsed after the reset · %s" % (
+                task["id"], self.render_proposal(usable, rejected)))
         return len(pending)
 
     # -- queue operations --------------------------------------------------

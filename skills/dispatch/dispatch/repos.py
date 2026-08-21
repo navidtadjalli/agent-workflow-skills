@@ -20,6 +20,32 @@ def root_path(config=None):
     return os.path.abspath(os.path.expanduser(config.get("projects_root") or "~/Projects"))
 
 
+def source_repo():
+    """The git repository this dispatch code is running out of, or None.
+
+    Dispatching into it means an unattended worker running ``git checkout -B
+    tg/<id>`` in the very checkout the daemon's own code is read from: it
+    switches the branch under anyone working there, and the next restart runs
+    whatever the worker left behind. Discovery drops it for that reason, not
+    because of anything about the project itself.
+    """
+    path = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.exists(os.path.join(path, ".git")):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def _same(left, right):
+    try:
+        return os.path.realpath(left) == os.path.realpath(right)
+    except OSError:
+        return False
+
+
 def _entry(path):
     # `.git` is a directory in a normal clone and a file holding a `gitdir:`
     # pointer in a linked worktree. Both can checkpoint to tg/<id>, so both
@@ -27,8 +53,13 @@ def _entry(path):
     return {"path": path, "git": os.path.exists(os.path.join(path, ".git"))}
 
 
-def discover(root=None, overrides=None):
-    """Every candidate folder, keyed by the name you would type in chat."""
+def discover(root=None, overrides=None, exclude=None, drop_source=True):
+    """Every candidate folder, keyed by the name you would type in chat.
+
+    ``drop_source`` removes the repository this code lives in; see
+    :func:`source_repo` for why that is the default rather than an option
+    someone has to remember to switch on.
+    """
     root = root or root_path()
     found = {}
     try:
@@ -43,6 +74,15 @@ def discover(root=None, overrides=None):
             found[name] = _entry(path)
     for alias, path in (overrides or {}).items():
         found[alias] = _entry(os.path.abspath(os.path.expanduser(path)))
+
+    blocked = [os.path.abspath(os.path.expanduser(p)) for p in (exclude or [])]
+    if drop_source:
+        mine = source_repo()
+        if mine:
+            blocked.append(mine)
+    if blocked:
+        found = {name: entry for name, entry in found.items()
+                 if not any(_same(entry["path"], b) for b in blocked)}
     return found
 
 

@@ -164,7 +164,9 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Task stuck `running`, no process | Daemon died mid-step | Restart the daemon; the lock is released with the process, then `dispatch cancel` and re-add |
 | Task `failed`, log looks complete | Worker omitted its status block | `dispatch logs <id>`, then re-add with the acceptance restated |
 | Everything `blocked` on one repo | The folder lost its `.git`, or was renamed or moved out of the projects root | `repos` in chat lists what is dispatchable; a repo outside the root needs `dispatch setup --repo alias=path` |
-| A stored free-form message came back `blocked` | It parsed to a repo that is not dispatchable; nothing, or only part, was queued -- the notice says which | Re-send it as `claude <task> on <repo>` |
+| A stored free-form message came back `blocked` | It parsed to a repo that is not dispatchable, so there was nothing to propose | Re-send it as `claude <task> on <repo>` |
+| `yes` says "nothing to confirm" | The proposal expired (10 minutes) or was already answered | Send the request again |
+| The bot proposes work but never queues it | A proposal waits for `yes`; nothing free-form dispatches on its own | Reply `yes`, or use `claude <task> on <repo>` to skip the round trip |
 | Mode stays `frozen` past the reset | Reset time was misparsed | `dispatch usage --poll`, then `dispatch resume` |
 | A lane reads `frozen` with a low session percentage | Its weekly window is at or above the soft limit | Nothing: it resumes when the week resets. `dispatch status` shows both windows |
 | The bot answers nothing, everything else looks healthy | Chat transport is failing | `dispatch status` prints the last transport error and how many polls have failed in a row |
@@ -175,6 +177,43 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Task `blocked` with `no worktree: fatal: 'tg/<id>' is already used by worktree at ...` | The task branch is checked out somewhere else | Move that checkout off the branch, or remove the stale worktree with `git worktree remove`, then `dispatch retry <id>` |
 | Task `blocked` with `no worktree: ... is not a git worktree` | Something else is sitting at the task's worktree path | Look at it, move it out of the way yourself -- the daemon will not delete a directory it did not create -- then `dispatch retry <id>` |
 | A codex task reports success from step two onward while changing nothing | Fixed: continuations were falling back to codex's own trust configuration, which is read-only for most paths. See "Codex confinement past the first step" |
+
+## Free-form intake asks first
+
+An explicit verb -- `claude <task> on <repo>`, `codex <task> on <repo>` -- queues
+immediately. Anything else is sent to a small model, turned into work, and
+*offered back*:
+
+```
+you> tidy the deps everywhere
+bot> parsed as:
+       claude "tidy deps" on qpay
+     reply `yes` to queue, `no` to drop
+```
+
+It queues on `yes`, drops on `no`, and expires after ten minutes so a `yes`
+typed later cannot start work you have stopped thinking about. One proposal is
+outstanding per chat; a second replaces the first, so `yes` is never ambiguous.
+
+The repos are checked while the proposal is built, not when you answer it: a
+proposal naming a folder that will not resolve would be asking you to approve
+work that cannot start. Anything unresolvable is listed as `skipping` in the
+same message.
+
+This exists because the previous behaviour queued straight from the parse,
+which made a typo indistinguishable from a request -- a stray word became a
+model call and then an unattended agent, with permission prompts disabled, in
+a real repository. A message sent while the window is exhausted is still
+stored and never lost; it comes back as a proposal after the reset rather than
+as a running task.
+
+## The bot cannot dispatch into its own source tree
+
+Discovery drops the repository the daemon's own code is running out of. A
+worker there would run `git checkout -B tg/<id>` in the checkout the daemon
+reads its code from -- switching the branch under anyone working in it, and
+leaving the next restart to run whatever the worker committed. The exclusion
+is by real path, so a symlink or a rename does not defeat it.
 
 ## Safety
 

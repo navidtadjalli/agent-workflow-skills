@@ -29,6 +29,9 @@ STATE_EMPTY = {
     "chat_error_at": None,
     # Per lane: why the last dispatch pass started nothing.
     "hold_reason": {},
+    # chat_id -> {"tasks": [...], "at": epoch, "text": str}. A free-form
+    # request the model turned into work, waiting for the sender to say yes.
+    "pending_confirm": {},
 }
 
 

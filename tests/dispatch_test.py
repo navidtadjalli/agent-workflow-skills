@@ -1455,6 +1455,38 @@ class TestRepoDiscovery(unittest.TestCase):
         self.assertEqual(repos.resolve("poook", root=self.root),
                          os.path.join(self.root, "poook"))
 
+    def test_the_dispatch_source_repo_is_never_dispatchable(self):
+        """The bot must not run an unattended agent in its own checkout.
+
+        A worker there does `git checkout -B tg/<id>` in the very tree the
+        daemon's code is read from: it switches the branch under anyone
+        working in it, and the next restart runs whatever the worker left.
+        """
+        source = repos.source_repo()
+        self.assertIsNotNone(source)
+        self.assertTrue(os.path.isdir(os.path.join(source, ".git")))
+        found = repos.discover(root=os.path.dirname(source))
+        self.assertNotIn(os.path.basename(source), found)
+
+    def test_the_source_repo_can_be_kept_when_asked(self):
+        """The exclusion is a default, not a law -- tests need the escape."""
+        source = repos.source_repo()
+        found = repos.discover(root=os.path.dirname(source), drop_source=False)
+        self.assertIn(os.path.basename(source), found)
+
+    def test_exclude_drops_a_named_path(self):
+        found = repos.discover(root=self.root, exclude=[
+            os.path.join(self.root, "poook")])
+        self.assertNotIn("poook", found)
+        self.assertIn("qpay-backend", found)
+
+    def test_exclusion_survives_a_symlinked_path(self):
+        """Compared by realpath, so an equivalent spelling still matches."""
+        link = os.path.join(self.tmp.name, "link-to-poook")
+        os.symlink(os.path.join(self.root, "poook"), link)
+        found = repos.discover(root=self.root, exclude=[link])
+        self.assertNotIn("poook", found)
+
     def test_linked_worktree_is_dispatchable(self):
         """A linked worktree's .git is a file holding a gitdir: pointer."""
         worktree = os.path.join(self.root, "linked")
@@ -1794,6 +1826,90 @@ class TestTwoLaneDaemon(unittest.TestCase):
             os.environ.pop("DISPATCH_HOME", None)
         else:
             os.environ["DISPATCH_HOME"] = self._previous
+
+    def _surface(self):
+        return ({"claude": "running", "codex": "running"},
+                {"claude": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                            "source": "measured", "resets_at": None},
+                 "codex": {"session_pct": 1.0, "week_pct": 1.0, "stale": False,
+                           "source": "codex-logs", "resets_at": None}})
+
+    def _say(self, daemon, text, now=None):
+        modes, readings = self._surface()
+        return daemon.handle_command(text, modes, readings, governor.blank(),
+                                     self.now if now is None else now, 0,
+                                     chat_id="1")
+
+    def test_free_form_proposes_instead_of_queueing(self):
+        """A typo must not become an unattended agent in a real repository."""
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "tidy deps"}], None)
+        reply = self._say(daemon, "tidy the deps everywhere")
+        self.assertIn("parsed as:", reply)
+        self.assertIn('claude "tidy deps" on qpay', reply)
+        self.assertIn("reply `yes` to queue", reply)
+        self.assertEqual(state.read_queue()["tasks"], [])
+
+    def test_yes_queues_the_proposal(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "tidy deps"}], None)
+        self._say(daemon, "tidy the deps everywhere")
+        reply = self._say(daemon, "yes")
+        self.assertIn("queued t-0001", reply)
+        task = state.read_queue()["tasks"][0]
+        self.assertEqual((task["repo"], task["prompt"]), ("qpay", "tidy deps"))
+        self.assertEqual(state.read_state()["pending_confirm"], {})
+
+    def test_no_drops_the_proposal(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "tidy deps"}], None)
+        self._say(daemon, "tidy the deps everywhere")
+        self.assertEqual(self._say(daemon, "no"), "dropped")
+        self.assertEqual(state.read_queue()["tasks"], [])
+        self.assertEqual(self._say(daemon, "yes"), "nothing to confirm")
+
+    def test_a_proposal_expires_rather_than_queueing_later(self):
+        """A `yes` typed hours later must not queue forgotten work."""
+        from dispatch import daemon as daemon_mod
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "tidy deps"}], None)
+        self._say(daemon, "tidy the deps everywhere")
+        reply = self._say(daemon, "yes", now=self.now + daemon_mod.PENDING_TTL + 1)
+        self.assertIn("expired", reply)
+        self.assertEqual(state.read_queue()["tasks"], [])
+        self.assertEqual(self._say(daemon, "yes"), "nothing to confirm")
+
+    def test_yes_with_nothing_pending_says_so(self):
+        self.assertEqual(self._say(self._daemon(), "yes"), "nothing to confirm")
+
+    def test_a_second_proposal_replaces_the_first(self):
+        """One outstanding proposal per chat, so `yes` is never ambiguous."""
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": text}], None)
+        self._say(daemon, "first thing")
+        self._say(daemon, "second thing")
+        self._say(daemon, "yes")
+        prompts = [t["prompt"] for t in state.read_queue()["tasks"]]
+        self.assertEqual(prompts, ["second thing"])
+
+    def test_an_unresolvable_repo_is_named_before_the_yes(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "qpay", "prompt": "good"},
+                                         {"repo": "typo-repo", "prompt": "bad"}], None)
+        reply = self._say(daemon, "do two things")
+        self.assertIn('claude "good" on qpay', reply)
+        self.assertIn("skipping", reply)
+        self.assertIn("typo-repo", reply)
+        self._say(daemon, "yes")
+        self.assertEqual([t["prompt"] for t in state.read_queue()["tasks"]], ["good"])
+
+    def test_nothing_dispatchable_parks_no_proposal(self):
+        daemon = self._daemon()
+        daemon.freeform = lambda text: ([{"repo": "typo-repo", "prompt": "x"}], None)
+        reply = self._say(daemon, "do a thing")
+        self.assertIn("nothing dispatchable", reply)
+        self.assertEqual(state.read_state()["pending_confirm"], {})
+        self.assertEqual(state.read_queue()["tasks"], [])
 
     def test_ping_answers_pong(self):
         daemon = self._daemon()
@@ -2159,7 +2275,8 @@ class TestTwoLaneDaemon(unittest.TestCase):
         and used to fall through to free-form intake -- must answer with
         something.
         """
-        samples = ["ping", "status", "queue", "usage", "usage poll", "help", "repos",
+        samples = ["ping", "yes", "no",
+                   "status", "queue", "usage", "usage poll", "help", "repos",
                    "sessions", "sessions qpay", "pause", "resume", "pause codex",
                    "resume claude", "cancel 1", "logs 1", "retry 1",
                    "claude fix the auth test", "claude tidy up on qpay",
@@ -2611,7 +2728,13 @@ class TestTwoLaneDaemon(unittest.TestCase):
         tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
         self.assertEqual(seen, ["tidy the deps everywhere"])
         self.assertEqual(tasks["t-0001"]["state"], "parsed")
-        self.assertEqual(tasks["t-0002"]["repo"], "qpay")
+        # Proposed, not queued: text stored while the window was exhausted is
+        # exactly the text nobody has looked at since.
+        self.assertNotIn("t-0002", tasks)
+        pending = state.read_state()["pending_confirm"]["1"]
+        self.assertEqual(pending["tasks"], [{"repo": "qpay", "prompt": "tidy deps"}])
+        self.assertTrue(any("reply `yes` to queue" in n for n in daemon.notices),
+                        daemon.notices)
 
     def test_stored_text_is_left_alone_while_the_lane_is_not_running(self):
         daemon = self._daemon(claude_pct=99.0)
@@ -2646,17 +2769,15 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self._stored()
         daemon.tick()
         tasks = {t["id"]: t for t in state.read_queue()["tasks"]}
-        stored = tasks["t-0001"]
-        self.assertEqual(stored["state"], "blocked")
-        self.assertIn("unknown repo", stored["last_error"])
-        self.assertTrue(any("t-0001 blocked" in notice for notice in daemon.notices),
-                        daemon.notices)
+        self.assertEqual(tasks["t-0001"]["state"], "parsed")
+        # The half that resolves is proposed; the half that does not is named
+        # in the same message, so the rejection is visible before `yes` rather
+        # than discovered after it.
+        pending = state.read_state()["pending_confirm"]["1"]
+        self.assertEqual([i["prompt"] for i in pending["tasks"]], ["first"])
         self.assertTrue(any("typo-repo" in notice for notice in daemon.notices),
                         daemon.notices)
-        # What did resolve is kept, and the notice says so rather than leaving
-        # the user to discover a half-applied parse.
-        self.assertEqual(tasks["t-0002"]["prompt"], "first")
-        self.assertTrue(any("t-0002" in notice for notice in daemon.notices),
+        self.assertTrue(any("skipping" in notice for notice in daemon.notices),
                         daemon.notices)
 
     def test_a_stored_message_with_no_usable_repo_at_all_queues_nothing(self):
@@ -2668,6 +2789,8 @@ class TestTwoLaneDaemon(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["state"], "blocked")
         self.assertIn("dispatchable", tasks[0]["last_error"])
+        # Nothing to say yes to, so nothing is parked waiting for a yes.
+        self.assertEqual(state.read_state()["pending_confirm"], {})
 
     def test_a_stored_message_that_parses_cleanly_still_settles_parsed(self):
         daemon = self._daemon()
