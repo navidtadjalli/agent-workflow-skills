@@ -116,16 +116,11 @@ once a tick, so it also collects a task cancelled while it was parked and one
 left behind by a daemon that died mid-step. Nothing collects the tree of a task
 you leave `blocked` forever -- that is deliberate, and it is a disk cost.
 
-**One thing to know if you run codex in worktrees.** `codex exec resume` takes
-no sandbox flag, so from step two onward a codex worker is confined by the trust
-levels in `~/.codex/config.toml`, which are keyed on the path. On this machine
-`~/Projects` is `trust_level = "trusted"` and everything else is not, so a
-multi-step codex task in a worktree under `~/.claude/dispatch/` runs read-only
-after its first step. Three ways out, in order of preference: mark the worktree
-root trusted in `~/.codex/config.toml`; set `worktree_root` to a directory
-inside `~/Projects` that is not a direct child of it (a direct child would be
-discovered as a repo); or use the claude lane for isolated work. Claude workers
-are unaffected -- their confinement is the directory they are pointed at.
+Codex workers in a worktree are confined the same way as anywhere else -- see
+**Codex confinement past the first step** below. A worktree is its own git repo
+root, so codex's trust map never covers one; `worktree_root` exists for other
+reasons, but moving worktrees somewhere "trusted" is not one of them and does
+not work.
 
 ## What the governor actually knows
 
@@ -179,7 +174,7 @@ gone, a fresh worker is seeded with `handoff.md` and the branch history.
 | Task `blocked` with `no worktree: fatal: invalid reference: HEAD` | `isolation=worktree` against a repository with no commits | Make one commit in the repo, then `dispatch retry <id>` |
 | Task `blocked` with `no worktree: fatal: 'tg/<id>' is already used by worktree at ...` | The task branch is checked out somewhere else | Move that checkout off the branch, or remove the stale worktree with `git worktree remove`, then `dispatch retry <id>` |
 | Task `blocked` with `no worktree: ... is not a git worktree` | Something else is sitting at the task's worktree path | Look at it, move it out of the way yourself -- the daemon will not delete a directory it did not create -- then `dispatch retry <id>` |
-| A codex worktree task does nothing after its first step | `codex exec resume` carries no sandbox flag and the worktree is outside a trusted path | See "Isolated worktrees" |
+| A codex task reports success from step two onward while changing nothing | Fixed: continuations were falling back to codex's own trust configuration, which is read-only for most paths. See "Codex confinement past the first step" |
 
 ## Safety
 
@@ -225,22 +220,64 @@ EOF
 dispatch down && dispatch up
 ```
 
-**`read-only` and `workspace-write` are first-step-only settings.** `codex exec
-resume` parses a narrower set of options than `codex exec` and accepts neither
-`-s` nor `--approve-for-me` (measured on codex-cli 0.148.0); it is also not
-passed `-C`, which that parser rejects outright, though the worker launches the
-process in the repository either way. So a continuation step carries no sandbox
-flag at all unless `codex_sandbox` is `bypass`, and falls back to codex's own
-configuration. On this machine that resolves to **workspace-write inside
-`~/Projects`**, because `~/.codex/config.toml` marks that tree
-`trust_level = "trusted"`, and read-only outside it.
+### Codex confinement past the first step
 
-Two consequences worth holding on to. `bypass` is the only mode that applies to
-every step of a task. And a task that takes more than one step is confined by
-`~/.codex/config.toml` from step two onward, not by `codex_sandbox` -- a
-security setting that stops applying halfway through is worth knowing about
-before it matters, so check the trust levels in that file if a repo needs to be
-more confined than the rest of `~/Projects`.
+`codex exec resume` parses a narrower set of options than `codex exec` and
+accepts neither `-s` nor `--approve-for-me` (measured on codex-cli 0.148.0);
+it is also not passed `-C`, which that parser rejects outright, though the
+worker launches the process in the repository either way.
+
+**This used to mean `codex_sandbox` applied only to a task's first step.** A
+continuation carried no sandbox flag at all and fell back to codex's own trust
+configuration -- and that resolves on the **git repository root**, not on any
+ancestor directory. Measured on this machine with `codex debug prompt-input`,
+which renders the prompt locally with no session and no request:
+
+```
+~/Projects                        workspace-write   (a `projects` entry; not a repo)
+~/Projects/qpay-backend           workspace-write   (its own `projects` entry)
+~/Projects/qpay-backend/anything  workspace-write   (same repo root)
+~/Projects/agent-workflow-skills  read-only         (a repo with no entry of its own,
+                                                     even though ~/Projects has one)
+/tmp/anywhere                     read-only
+```
+
+So every repository without a `projects` entry of its own, and every isolated
+worktree without exception, ran **read-only from step two onward** -- reading
+and thinking and changing nothing, then reporting `complete`. That is the
+"succeeds while doing nothing" shape, and it was not visible from any surface.
+
+**It is fixed.** A resumed step now carries the configured mode as `-c`
+overrides, which `resume` does accept:
+
+| `codex_sandbox` | first step | every later step |
+|---|---|---|
+| `read-only` | `-s read-only` | `-c sandbox_mode="read-only"` |
+| `approve-for-me` (default) | `--approve-for-me` | `-c sandbox_mode="workspace-write"` |
+| `workspace-write` | `-s workspace-write` | `-c sandbox_mode="workspace-write"` |
+| `danger-full-access` | `-s danger-full-access` | `-c sandbox_mode="danger-full-access"` |
+| `bypass` | `--dangerously-bypass-approvals-and-sandbox` | the same flag |
+
+`approve-for-me` maps to `workspace-write` because that is what the flag itself
+selects: its own help reads "route approval requests through automatic review
+using the workspace-write sandbox".
+
+**The sandbox now matches on every step; approvals do not, and cannot.** The
+other half of `--approve-for-me` is the automatic reviewer, and no way was found
+to turn it on for a resumed step -- the flag is rejected and
+`approval_policy = "granular"` is execpolicy rule matching, not automatic
+review. So resumed steps also carry `-c approval_policy="never"`, which tells
+the model up front that escalation will be refused. The alternative is worse:
+with the policy unset the model is handed the full escalation instructions and
+invited to ask, unattended, for something no reviewer and no human will answer
+-- a step that stalls until `step_timeout` kills it. What is lost is an
+escalation that automatic review would have granted, such as a network install;
+what is kept is everything inside the workspace, which is what a checkpointing
+worker needs.
+
+`--strict-config` is deliberately not used: it rejects unrecognized fields in
+`config.toml`, so one stale key in your own file would fail every continuation
+of every task while first steps kept working.
 
 Claude has no equivalent flag: `--dangerously-skip-permissions` is how a
 headless Claude worker runs unattended, and the confinement there is the repo it

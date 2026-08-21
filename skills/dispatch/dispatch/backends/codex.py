@@ -23,10 +23,64 @@ options than ``codex exec``: measured on codex-cli 0.148.0 it takes neither
 ``-s`` nor ``--approve-for-me`` nor ``-C``, and rejects each with ``error:
 unexpected argument`` and exit 2 -- before doing any work, so the step dies with
 no status file and settles as a failure that reads like the agent misbehaving.
-Two things follow. A continuation runs under codex's own default policy unless
-the bypass was asked for explicitly, and it is not told a working directory:
-``worker.run_step`` launches the process with ``cwd=cwd`` regardless, so ``-C``
-was belt-and-braces on a first step and illegal on a resume.
+It is not told a working directory either: ``worker.run_step`` launches the
+process with ``cwd=cwd`` regardless, so ``-C`` was belt-and-braces on a first
+step and illegal on a resume.
+
+What resume *does* take is ``-c``, and that is how the configured confinement
+now reaches every step instead of only the first. Until it did, a continuation
+carried no sandbox flag at all and fell back to codex's own trust
+configuration -- which resolves on the **git repository root**, not on any
+ancestor directory. Measured against this machine with ``codex debug
+prompt-input`` (a local renderer: no session, no request, no quota):
+
+    ~/Projects                      -> workspace-write   (a `projects` entry, not a repo)
+    ~/Projects/qpay-backend         -> workspace-write   (its own `projects` entry)
+    ~/Projects/qpay-backend/sub     -> workspace-write   (same repo root)
+    ~/Projects/agent-workflow-skills-> read-only         (a repo with no entry of its own,
+                                                          even though ~/Projects has one)
+    /tmp/anywhere                   -> read-only
+
+So the fallback was read-only for every repository without its own trust entry,
+and for every linked worktree without exception -- a worktree's repo root is
+itself. Step one wrote, step two onward could read and think and change
+nothing, and reported success for it. Parking worktrees somewhere "trusted"
+does not fix that: each worktree is its own repo root and would need its own
+entry.
+
+The override does fix it, and both keys were verified rather than guessed --
+a bad *value* is a loud deserialize error naming the valid variants, which is
+how the variant lists below were obtained:
+
+    -c sandbox_mode="workspace-write"    -> workspace-write   (read-only, workspace-write,
+                                                               danger-full-access)
+    -c approval_policy="never"           -> "Approval policy is currently never. Do not
+                                            provide the `sandbox_permissions` for any
+                                            reason, commands will be rejected."
+                                            (untrusted, on-failure, on-request,
+                                             granular, never)
+
+``approval_policy="never"`` is the half of ``--approve-for-me`` that cannot be
+reproduced on this path, replaced by the safest thing that can. ``--approve-for-me``
+is documented as "route approval requests through automatic review using the
+workspace-write sandbox": a sandbox *and* an auto-reviewer. Resume rejects the
+flag, and no config key was found that turns the auto-reviewer on --
+``approval_policy="granular"`` is a struct wanting ``sandbox_approval`` and
+``rules``, which is execpolicy rule matching, not automatic review. Leaving the
+policy unset instead renders the full escalation-request instructions, which
+*invites* the model to ask for something no reviewer and no human will answer:
+an unattended step that stalls until ``step_timeout`` kills it. ``never`` tells
+the model up front that escalation will be refused, so it works inside the
+sandbox or reports blocked. Refusing an escalation costs a capability; stalling
+costs the step, and bypassing costs the sandbox.
+
+``--strict-config`` is deliberately not used. It rejects unrecognized fields in
+``config.toml``, so on this path it would let an unrelated stale key in the
+user's own file fail every continuation of every task while first steps kept
+working -- and it would not catch a typo in the keys emitted here, because an
+unrecognized ``-c`` key is silently ignored while a bad value already errors
+loudly. Whether it validates ``-c`` overrides at all could not be measured
+without starting a real session.
 
 Known gap: the session id is recovered by looking for ``thread_id`` /
 ``session_id`` / ``conversation_id`` anywhere in the ``--json`` event stream. If
@@ -69,11 +123,25 @@ DEFAULT_SANDBOX = "approve-for-me"
 
 # `codex exec resume` is a narrower parser than `codex exec`. Measured on
 # codex-cli 0.148.0, it rejects `-s` and `--approve-for-me` outright -- `error:
-# unexpected argument` -- and takes only the bypass flag. A flag it rejects is
-# not a weaker sandbox; it is a step that exits 2 before doing anything. So a
-# continuation carries only what resume accepts, and otherwise runs under
-# codex's own default policy.
+# unexpected argument` -- and takes only the bypass flag among the three. A
+# flag it rejects is not a weaker sandbox; it is a step that exits 2 before
+# doing anything. So the bypass keeps its flag and every other mode is
+# expressed with `-c`, which resume does accept.
 RESUME_MODES = ("bypass",)
+
+# The sandbox each mode resolves to once the first step is over. `approve-for-me`
+# lands on workspace-write because that is what the flag itself selects: "route
+# approval requests through automatic review using the workspace-write sandbox".
+RESUME_SANDBOX = {
+    "read-only": "read-only",
+    "approve-for-me": "workspace-write",
+    "workspace-write": "workspace-write",
+    "danger-full-access": "danger-full-access",
+}
+
+# No auto-reviewer and no human exists on a resumed step, so an escalation
+# request can only stall. See the module docstring.
+RESUME_APPROVAL = "never"
 
 
 STATUS_FILE = "last.json"
@@ -124,7 +192,10 @@ def sandbox_args(config=None, resuming=False):
               file=sys.stderr)
         mode, args = DEFAULT_SANDBOX, SANDBOX_MODES[DEFAULT_SANDBOX]
     if resuming and mode not in RESUME_MODES:
-        return []
+        # `-c key=value` parses its value as TOML, so the quotes are part of
+        # the argv element, not shell noise.
+        return ["-c", 'sandbox_mode="%s"' % RESUME_SANDBOX[mode],
+                "-c", 'approval_policy="%s"' % RESUME_APPROVAL]
     return list(args)
 
 

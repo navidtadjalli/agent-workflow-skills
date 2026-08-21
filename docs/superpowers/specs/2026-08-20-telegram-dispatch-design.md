@@ -259,7 +259,9 @@ path did not manage.
   accepts a `.git` file as a dispatchable repository, so a worktree among the
   checkouts would be dispatchable in its own right -- reachable from chat, under
   a `repo-<name>` lock, inside another task's private tree. `worktree_root`
-  overrides it for the codex trust-level case in `docs/operations.md`.
+  overrides it, though not for the codex case: a worktree is its own git repo
+  root, so codex's trust map never covers one wherever it is parked. That is
+  handled on the resume path instead -- see **Codex confinement** below.
 - **Lifecycle.** Removed at `done`, `cancelled`, or disappearance from the
   queue; kept at `paused`, which resumes into it, and kept at `blocked` and
   `failed`, where `handoff.md` names it and the uncommitted remains of the last
@@ -282,6 +284,36 @@ path did not manage.
   when HEAD is not already the branch. A worktree is created *on* `tg/<id>`, so
   the checkout is skipped -- which is necessary as well as tidy: git refuses to
   check out a branch that is live in another worktree.
+
+### Codex confinement
+
+`codex_sandbox` used to apply to a task's first step only. `codex exec resume`
+accepts neither `-s` nor `--approve-for-me`, so a continuation carried no
+sandbox flag and fell back to codex's own trust configuration -- which resolves
+on the **git repository root**, not on an ancestor. Measured with `codex debug
+prompt-input` (local render, no session, no request): `~/Projects` and
+`~/Projects/qpay-backend` are workspace-write, `~/Projects/agent-workflow-skills`
+is read-only because it is a repo with no entry of its own, and every isolated
+worktree is read-only because a worktree is its own repo root. So most
+multi-step codex tasks could read and think and change nothing from step two
+onward, and reported `complete` for it.
+
+Resume does accept `-c`, and `sandbox_mode` is a real key with real effect, so
+the configured mode is now translated onto the resume path: `read-only`,
+`workspace-write` and `danger-full-access` map to themselves, `approve-for-me`
+maps to `workspace-write` (what that flag itself selects), and `bypass` keeps
+its flag.
+
+The sandbox now matches on every step. **Approvals do not, and cannot:** the
+other half of `--approve-for-me` is an automatic reviewer, the flag is rejected
+on resume, and no key was found that enables one -- `approval_policy =
+"granular"` is execpolicy rule matching. Resumed steps therefore carry
+`-c approval_policy="never"`, which tells the model escalation will be refused
+rather than inviting it to ask, unattended, for something nothing can answer.
+A refused escalation costs a capability; an invited one costs the whole step to
+`step_timeout`, and a bypass costs the sandbox. `--strict-config` is not used:
+it would let one stale key in the user's `config.toml` fail every continuation
+while first steps kept working.
 
 Everything above parses with zero model calls, which is the property that lets
 the daemon keep answering while a window is exhausted. Free-form text still
@@ -491,6 +523,8 @@ Integration coverage in `tests/dispatch_integration.py`:
 - worktree kept at `paused` and `blocked`, released at `done` and `cancelled`
 - creation failures -- no commits, branch already checked out, a foreign
   directory in the way -- blocking the task rather than running in the parent
+- the resumed codex argv per `codex_sandbox` mode, on the real launch, argv
+  recorded by the stub; and the same for a resumed step inside a worktree
 - one lane freezing while the other keeps dispatching
 - a codex task admitted from a stale-but-unexpired reading
 - prompt-file round trip: enqueue writes it, the stub agent reads it on stdin

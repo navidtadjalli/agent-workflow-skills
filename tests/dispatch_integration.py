@@ -607,6 +607,62 @@ class DispatchIntegration(unittest.TestCase):
         self.assertEqual(state.find(state.read_queue(), task["id"])["state"],
                          "done")
 
+    def test_the_configured_sandbox_survives_into_a_resumed_codex_step(self):
+        """`codex exec resume` takes no sandbox flag, so a continuation used to
+        run under codex's own trust configuration -- read-only for any repo
+        without its own entry, and for every worktree. Step one wrote, step two
+        onward could not, and said `complete` anyway. Asserted on the real
+        launch, argv recorded by the stub; a live codex is never invoked."""
+        os.environ["STUB_MODE"] = "continue"
+        task = self._enqueue("codex work", agent="codex")
+        self._daemon().tick()
+        os.environ["STUB_MODE"] = "complete"
+        self.now += 120
+        self._daemon().tick()
+
+        first, second = self._codex_argv()[:2]
+        self.assertIn("--approve-for-me", first)
+        # The sandbox half of `--approve-for-me`, which resume rejects.
+        self.assertEqual(second[second.index('sandbox_mode="workspace-write"') - 1],
+                         "-c")
+        # Nothing can answer an escalation on this path, so nothing may ask.
+        self.assertEqual(second[second.index('approval_policy="never"') - 1], "-c")
+        self.assertNotIn("--approve-for-me", second)
+        self.assertNotIn("-s", second)
+        self.assertEqual(state.find(state.read_queue(), task["id"])["state"],
+                         "done")
+
+    def test_a_resumed_step_in_a_worktree_is_confined_the_same_way(self):
+        """The two changes meet here: a worktree is its own git repo root, so
+        codex's trust map never covers one and the override is the only thing
+        that gives a resumed step write access to it."""
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("codex work", agent="codex", isolation="worktree")
+        daemon = self._daemon()
+        seen = self._watch(daemon)
+        daemon.tick()
+        self.now += 120
+        daemon.tick()
+
+        first, second = self._codex_argv()[:2]
+        self.assertEqual(first[first.index("-C") + 1], seen["t-0001"])
+        self.assertNotEqual(os.path.realpath(seen["t-0001"]),
+                            os.path.realpath(self.repo))
+        self.assertIn('sandbox_mode="workspace-write"', second)
+        self.assertIn('approval_policy="never"', second)
+
+    def test_the_bypass_still_resumes_as_a_flag_not_an_override(self):
+        os.environ["STUB_MODE"] = "continue"
+        self._enqueue("codex work", agent="codex")
+        daemon = self._daemon(config_extra={"codex_sandbox": "bypass"})
+        daemon.tick()
+        self.now += 120
+        daemon.tick()
+
+        second = self._codex_argv()[1]
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", second)
+        self.assertNotIn("-c", second)
+
     def test_codex_lane_runs_while_the_claude_lane_is_frozen(self):
         self._enqueue("claude work", agent="claude")
         self._enqueue("codex work", agent="codex")

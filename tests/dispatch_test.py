@@ -1133,8 +1133,8 @@ class TestBackends(unittest.TestCase):
         Measured against codex-cli 0.148.0: `codex exec resume -s ... --help`
         and `... --approve-for-me --help` both exit 2 with `unexpected
         argument`. A rejected flag is not a weaker sandbox, it is a step that
-        never starts -- so a continuation carries neither, and runs under
-        codex's own default policy instead.
+        never starts -- so a continuation carries neither, and says the same
+        thing with `-c` instead.
         """
         task = dict(self.task, agent="codex", session_id="abc")
         for mode in ("approve-for-me", "read-only", "workspace-write",
@@ -1205,6 +1205,93 @@ class TestBackends(unittest.TestCase):
                          if a.startswith("-") and a != "-"
                          and a not in self.RESUME_ACCEPTS]
             self.assertEqual(offenders, [], "%s: %s" % (mode, argv))
+
+    # The confinement a resumed step gets, per configured mode. Verified
+    # against codex-cli 0.148.0 with `codex debug prompt-input` -- a local
+    # renderer, no session and no request -- in a directory codex does not
+    # trust, reading the `sandbox_mode` the model is actually told about:
+    #
+    #   (no override)                     -> read-only    <- what resumes used to get
+    #   -c sandbox_mode="read-only"       -> read-only
+    #   -c sandbox_mode="workspace-write" -> workspace-write
+    #   -c sandbox_mode="danger-full-access" -> danger-full-access
+    RESUME_SANDBOX = {
+        "read-only": "read-only",
+        # `--approve-for-me` is documented as "route approval requests through
+        # automatic review using the workspace-write sandbox", so this is the
+        # sandbox half of it, exactly.
+        "approve-for-me": "workspace-write",
+        "workspace-write": "workspace-write",
+        "danger-full-access": "danger-full-access",
+    }
+
+    def _resumed(self, mode):
+        return backends.codex.build_command(
+            dict(self.task, agent="codex", session_id="abc"), "/p/prompt.txt",
+            "/repo", self.tmp.name, config={"codex_sandbox": mode})
+
+    def test_the_configured_sandbox_reaches_every_step_not_just_the_first(self):
+        """`codex exec resume` takes no sandbox flag, so a continuation used to
+        fall back to codex's own trust configuration -- which resolves on the
+        **git repository root**, not on an ancestor. Measured on this machine:
+        `~/Projects` is trusted and so is `~/Projects/qpay-backend`, but
+        `~/Projects/agent-workflow-skills` is a repo with no entry of its own
+        and renders read-only, as does every linked worktree, whose repo root is
+        itself. Step one wrote; step two onward could read and think and change
+        nothing, and reported success for it."""
+        for mode, sandbox in self.RESUME_SANDBOX.items():
+            argv = self._resumed(mode)
+            self.assertIn("-c", argv, mode)
+            self.assertIn('sandbox_mode="%s"' % sandbox, argv, mode)
+            # Paired: `-c` immediately precedes the value it carries.
+            self.assertEqual(argv[argv.index('sandbox_mode="%s"' % sandbox) - 1],
+                             "-c", mode)
+
+    def test_a_resumed_step_is_told_not_to_ask_for_an_escalation(self):
+        """Nothing can answer one. `--approve-for-me` routes approvals through
+        automatic review and the resume parser rejects it; no config key was
+        found that turns that reviewer on (`approval_policy="granular"` is a
+        struct wanting `sandbox_approval` and `rules` -- execpolicy matching,
+        not automatic review). With the policy left unset the model is handed
+        the full escalation instructions and invited to ask, unattended, for
+        something no reviewer and no human will answer: a step that stalls
+        until `step_timeout` kills it. `never` renders "Approval policy is
+        currently never. Do not provide the `sandbox_permissions` for any
+        reason, commands will be rejected", so it works inside the sandbox or
+        reports blocked."""
+        for mode in self.RESUME_SANDBOX:
+            argv = self._resumed(mode)
+            self.assertIn('approval_policy="never"', argv, mode)
+            self.assertEqual(argv[argv.index('approval_policy="never"') - 1],
+                             "-c", mode)
+
+    def test_the_first_step_is_unchanged_by_any_of_it(self):
+        """The `-c` translation is for the resume parser only; a first step
+        keeps the flags that were already measured against the real tool."""
+        for mode in ("read-only", "approve-for-me", "workspace-write",
+                     "danger-full-access", "bypass"):
+            argv = backends.codex.build_command(
+                dict(self.task, agent="codex"), "/p/prompt.txt", "/repo",
+                self.tmp.name, config={"codex_sandbox": mode})
+            self.assertNotIn('sandbox_mode="%s"' % mode, argv, mode)
+            self.assertNotIn('approval_policy="never"', argv, mode)
+
+    def test_strict_config_is_not_used(self):
+        """It rejects unrecognized fields in the user's own `config.toml`, so
+        here it would let one stale key fail every continuation of every task
+        while first steps kept working. It would not catch a typo in the keys
+        emitted above either: an unrecognized `-c` key is silently ignored,
+        while a bad *value* already errors loudly on its own
+        (`unknown variant ... expected one of read-only, workspace-write,
+        danger-full-access`)."""
+        for mode in ("approve-for-me", "bypass"):
+            self.assertNotIn("--strict-config", self._resumed(mode), mode)
+
+    def test_an_unknown_mode_resumes_into_the_default_sandbox_too(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            argv = self._resumed("yolo")
+        self.assertIn('sandbox_mode="workspace-write"', argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
 
     def test_an_explicit_bypass_is_the_one_mode_a_resume_still_takes(self):
         argv = backends.codex.build_command(
