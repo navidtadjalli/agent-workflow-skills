@@ -99,10 +99,110 @@ Every module below the daemon is a pure function of injected clock and usage
 values, which is why the whole decision surface is testable with no network,
 no subprocess, and no real time passing.
 
-## Running it
+## Installation
+
+Needs Python 3 (standard library only — there is nothing to `pip install`),
+plus `git`, `tmux`, and `cron`. `claude` and `codex` are only needed on `PATH`
+for the lanes you actually intend to use.
+
+**1. Get the code.**
 
 ```bash
-dispatch setup --chat <chat-id>   # writes config; disables the conflicting plugin
+git clone https://github.com/navidtadjalli/agent-workflow-skills.git
+```
+
+Clone it somewhere that is *not* inside your projects root. Discovery drops
+this repository automatically, but keeping the daemon's own source out of the
+tree it dispatches into is one less thing depending on that.
+
+**2. Put the CLI on `PATH`.**
+
+```bash
+ln -sf "$PWD/agent-workflow-skills/skills/dispatch/scripts/dispatch" ~/.local/bin/dispatch
+dispatch --help
+```
+
+The script inserts its own package directory on `sys.path`, so the symlink is
+the whole install — no virtualenv, no `PYTHONPATH`.
+
+**3. Give it a bot token.**
+
+Create a bot with [@BotFather](https://t.me/BotFather) and write the token to
+the channel env file:
+
+```bash
+mkdir -p ~/.claude/channels/telegram
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "<token>" > ~/.claude/channels/telegram/.env
+chmod 600 ~/.claude/channels/telegram/.env
+```
+
+That path is where the daemon reads it from at runtime; override with
+`DISPATCH_TOKEN_ENV`. The token is **never** copied into dispatch's own state.
+
+Telegram allows exactly one `getUpdates` consumer per token. If anything else
+is already polling that bot — an in-session chat plugin, another script — they
+will 409 each other. `dispatch setup` disables the known conflicting plugin for
+you; pass `--keep-plugin` to leave it alone and sort it out yourself.
+
+**4. Find your chat id** by messaging the bot once, then:
+
+```bash
+curl -s "https://api.telegram.org/bot<token>/getUpdates" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["result"][0]["message"]["chat"]["id"])'
+```
+
+**5. Write the config.**
+
+```bash
+dispatch setup --chat <chat-id>
+```
+
+The allowlist **fails closed**: with no chat id configured, nothing can reach
+it. Add `--repo alias=/path` only for repositories outside `~/Projects`;
+everything inside it is discovered automatically.
+
+**6. Start it and check.**
+
+```bash
+dispatch up
+```
+
+Send `ping` from Telegram. You should get `pong` back. If nothing arrives:
+
+```bash
+dispatch logs --daemon
+```
+
+No token means the daemon is running on a null transport; a 409 means
+something else still holds the bot; silence with no error usually means your
+chat id is not on the allowlist.
+
+**7. Install the watchdog** — nothing else supervises the daemon:
+
+```bash
+( crontab -l 2>/dev/null
+  echo '*/5 * * * * '"$HOME"'/.local/bin/dispatch up --if-dead >/dev/null 2>&1'
+  echo '@reboot '"$HOME"'/.local/bin/dispatch up --if-dead >/dev/null 2>&1'
+) | crontab -
+```
+
+### Uninstalling
+
+```bash
+dispatch down
+crontab -l | grep -v 'dispatch up --if-dead' | crontab -
+rm ~/.local/bin/dispatch
+rm -rf ~/.claude/dispatch      # config, queue, state, per-task artifacts
+```
+
+The bot token is not dispatch's to remove; delete
+`~/.claude/channels/telegram/.env` yourself if nothing else uses it.
+
+## Running it
+
+Day to day, once installed:
+
+```bash
 dispatch up                       # start in tmux (idempotent)
 dispatch status                   # works whether or not the daemon is up
 dispatch logs --daemon            # tail the daemon's own output
